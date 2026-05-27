@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Liquid Hand · 液态手势</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <video
+    id="video"
+    autoplay
+    muted
+    playsinline
+    webkit-playsinline
+    disablepictureinpicture
+    disableremoteplayback
+  ></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="hud">
+    <div class="logo">LIQUID<span>HAND</span></div>
+    <div id="status">正在初始化...</div>
+    <div class="hint">镜像自拍 · 手划哪里 · 哪里出现液态玻璃</div>
+  </div>
+
+  <div id="overlay">
+    <div class="overlay-glow"></div>
+    <h1>LIQUID HAND</h1>
+    <p>流体模拟 · 液态玻璃 · 持续拖尾 · 水波纹</p>
+    <p id="envWarning" class="env-warning" hidden></p>
+    <button id="startBtn" type="button">开启摄像头体验</button>
+    <p class="privacy">画面仅在本地处理，不会上传</p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="script.js"></script>
+</body>
+</html>
