@@ -282,7 +282,7 @@ function resize() {
   if (!renderer) return;
   const { w, h } = getScreenSize();
   renderer.setSize(w, h, false);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setPixelRatio(isMobileDevice() ? 1 : 2);
   if (displayMat) {
     displayMat.uniforms.uResolution.value.set(w, h);
     displayMat.uniforms.uHandRadius.value = VISUAL.handRadiusPx;
@@ -700,7 +700,7 @@ function initShaders() {
 
 function initFluid() {
   const isMobile = isMobileDevice();
-  const base = isMobile ? 224 : 384;
+  const base = isMobile ? 160 : 384;
   const aspect = window.innerWidth / Math.max(window.innerHeight, 1);
   simH = base;
   simW = Math.round(base * Math.min(Math.max(aspect, 0.65), 1.75));
@@ -958,10 +958,10 @@ function initMediaPipe() {
   });
 
   hands.setOptions({
-    maxNumHands: 2,
-    modelComplexity: isMobileDevice() ? 0 : 1,
-    minDetectionConfidence: 0.55,
-    minTrackingConfidence: 0.45,
+    maxNumHands: 1,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.35,
+    minTrackingConfidence: 0.35,
   });
 
   hands.onResults(processHands);
