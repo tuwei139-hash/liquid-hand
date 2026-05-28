@@ -35,8 +35,8 @@ function getVisual() {
     glassBlend: 0.92,
     glowStrength: 0.07,
     fluidHandBoost: 0.18,
-    minHandMask: 0.72,
-    splatDensityMul: 2.0,
+    minHandMask: 0.38,
+    splatDensityMul: 2.4,
   };
 }
 
@@ -55,7 +55,10 @@ function applyVisualUniforms() {
     displayMat.uniforms.uFluidHandBoost.value = v.fluidHandBoost;
   }
   if (displayMat.uniforms.uMinHandMask) {
-    displayMat.uniforms.uMinHandMask.value = handEffectReady ? v.minHandMask : 0;
+    const mobile = isMobileDevice();
+    const readyMask = handEffectReady ? v.minHandMask : 0;
+    const liveMask = mobile && pointCount > 0 ? v.minHandMask * 0.55 : 0;
+    displayMat.uniforms.uMinHandMask.value = Math.max(readyMask, liveMask);
   }
   if (splatDenMat?.uniforms?.uDensityMul) {
     splatDenMat.uniforms.uDensityMul.value = v.splatDensityMul;
@@ -161,6 +164,9 @@ function getRenderTargetType(rendererInstance) {
   if (!rendererInstance.capabilities.isWebGL2) {
     return THREE.UnsignedByteType;
   }
+  if (isMobileDevice()) {
+    return THREE.HalfFloatType;
+  }
   try {
     const gl = rendererInstance.getContext();
     if (gl.getExtension("EXT_color_buffer_float") || gl.getExtension("OES_texture_half_float")) {
@@ -232,6 +238,7 @@ function resize() {
   if (displayMat) {
     displayMat.uniforms.uResolution.value.set(w, h);
   }
+  updateVideoCoverUniforms();
   applyVisualUniforms();
   updateSimResolutionUniforms();
 }
@@ -255,32 +262,46 @@ function mirrorX(x) {
   return 1.0 - x;
 }
 
-function needsVideoRotation() {
-  if (!isMobileDevice()) return false;
+/** object-fit:cover — 与 style.css 中 video 及 display 着色器一致 */
+function getVideoCoverTransform() {
   const vw = video.videoWidth || 1;
   const vh = video.videoHeight || 1;
-  const { h: sh, w: sw } = getScreenSize();
-  return sh > sw && vw > vh;
+  const { w, h } = getScreenSize();
+  const videoAspect = vw / vh;
+  const screenAspect = w / h;
+  let scaleX = 1;
+  let scaleY = 1;
+  if (screenAspect > videoAspect) {
+    scaleY = videoAspect / screenAspect;
+  } else {
+    scaleX = screenAspect / videoAspect;
+  }
+  return {
+    scaleX,
+    scaleY,
+    offsetX: (1 - scaleX) * 0.5,
+    offsetY: (1 - scaleY) * 0.5,
+  };
+}
+
+function updateVideoCoverUniforms() {
+  if (!displayMat?.uniforms?.uVideoScale) return;
+  const t = getVideoCoverTransform();
+  displayMat.uniforms.uVideoScale.value.set(t.scaleX, t.scaleY);
+  displayMat.uniforms.uVideoOffset.value.set(t.offsetX, t.offsetY);
 }
 
 function mapLandmark(lmX, lmY, vx = 0, vy = 0) {
-  let x = lmX;
-  let y = lmY;
-  let outVx = vx;
-  let outVy = vy;
-
-  if (needsVideoRotation()) {
-    x = lmY;
-    y = 1.0 - lmX;
-    outVx = -vy;
-    outVy = vx;
-  }
-
+  const t = getVideoCoverTransform();
+  const sx = lmX * t.scaleX + t.offsetX;
+  const sy = lmY * t.scaleY + t.offsetY;
+  const dSx = vx * t.scaleX;
+  const dSy = vy * t.scaleY;
   return {
-    x: mirrorX(x),
-    y,
-    vx: -outVx,
-    vy: outVy,
+    x: mirrorX(sx),
+    y: sy,
+    vx: -dSx,
+    vy: dSy,
   };
 }
 
@@ -293,6 +314,9 @@ function isPlausibleHand(landmarks) {
     landmarks[5].x - landmarks[17].x,
     landmarks[5].y - landmarks[17].y
   );
+  if (isMobileDevice()) {
+    return spread > 0.055 && palmWidth > 0.045;
+  }
   const palm = landmarks[PALM_INDEX];
   const wrist = landmarks[0];
   const palmAboveWrist = palm.y < wrist.y - 0.02;
@@ -601,6 +625,8 @@ function initShaders() {
       uHandAnchor: { value: new THREE.Vector2(0.5, 0.5) },
       uHandStrength: { value: 0 },
       uMinHandMask: { value: 0 },
+      uVideoScale: { value: new THREE.Vector2(1, 1) },
+      uVideoOffset: { value: new THREE.Vector2(0, 0) },
     },
     vertexShader: FULLSCREEN_VS,
     fragmentShader: `
@@ -625,10 +651,13 @@ function initShaders() {
       uniform vec2 uHandAnchor;
       uniform float uHandStrength;
       uniform float uMinHandMask;
+      uniform vec2 uVideoScale;
+      uniform vec2 uVideoOffset;
 
       varying vec2 vUv;
 
-      vec2 videoUv(vec2 uv) {
+      vec2 videoUv(vec2 screenUv) {
+        vec2 uv = (screenUv - uVideoOffset) / uVideoScale;
         return vec2(1.0 - uv.x, uv.y);
       }
 
@@ -944,6 +973,7 @@ function renderFrame(dt, time) {
   displayMat.uniforms.uFlow.value = flowPP.read.texture;
   displayMat.uniforms.uTrail.value = trailPP.read.texture;
   displayMat.uniforms.uTime.value = time;
+  updateVideoCoverUniforms();
 
   const prev = renderer.getRenderTarget();
   renderer.setRenderTarget(null);
@@ -956,7 +986,7 @@ function injectPoint(mx, y, vx, vy, strength) {
   if (pointCount >= MAX_POINTS) return;
 
   const s = smoothed[pointCount];
-  const t = VISUAL.smoothFactor;
+  const t = getVisual().smoothFactor;
   s.x += (mx - s.x) * t;
   s.y += (y - s.y) * t;
   s.vx += (vx - s.vx) * t;
@@ -999,7 +1029,7 @@ function processHands(results) {
   }
 
   handDetectStreak++;
-  handEffectReady = handDetectStreak >= (mobile ? 3 : 1);
+  handEffectReady = handDetectStreak >= (mobile ? 2 : 1);
   setStatus(`已识别 ${results.multiHandLandmarks.length} 只手 · 移动手指划过液态玻璃`);
 
   const palm = landmarks[PALM_INDEX];
@@ -1092,8 +1122,8 @@ async function trackHands() {
   const mobile = isMobileDevice();
   frameCount++;
   if (mobile) {
-    if (frameCount % 3 !== 0) return;
-    if (Date.now() - lastHandsSendAt < 200) return;
+    if (frameCount % 2 !== 0) return;
+    if (Date.now() - lastHandsSendAt < 120) return;
   }
 
   handBusy = true;
