@@ -18,7 +18,39 @@ const VISUAL = {
   chromaticAberration: 0.0008,
   glassBlend: 0.72,
   glowStrength: 0.04,
+  fluidHandBoost: 0.04,
 };
+
+function getVisual() {
+  if (!isMobileDevice()) return VISUAL;
+  return {
+    handRadiusPx: 300,
+    splatRadius: 0.055,
+    smoothFactor: 0.42,
+    trailRetain: 0.65,
+    distortScale: 0.04,
+    chromaticAberration: 0.001,
+    glassBlend: 0.9,
+    glowStrength: 0.06,
+    fluidHandBoost: 0.14,
+  };
+}
+
+function applyVisualUniforms() {
+  const v = getVisual();
+  if (splatVelMat?.uniforms?.uRadius) splatVelMat.uniforms.uRadius.value = v.splatRadius;
+  if (splatDenMat?.uniforms?.uRadius) splatDenMat.uniforms.uRadius.value = v.splatRadius;
+  if (trailMat?.uniforms?.uRetain) trailMat.uniforms.uRetain.value = v.trailRetain;
+  if (!displayMat) return;
+  displayMat.uniforms.uHandRadius.value = v.handRadiusPx;
+  displayMat.uniforms.uDistortScale.value = v.distortScale;
+  displayMat.uniforms.uCA.value = v.chromaticAberration;
+  displayMat.uniforms.uGlassBlend.value = v.glassBlend;
+  displayMat.uniforms.uGlow.value = v.glowStrength;
+  if (displayMat.uniforms.uFluidHandBoost) {
+    displayMat.uniforms.uFluidHandBoost.value = v.fluidHandBoost;
+  }
+}
 
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
@@ -112,9 +144,6 @@ function checkLibraries() {
 }
 
 function getRenderTargetType(rendererInstance) {
-  if (isMobileDevice()) {
-    return THREE.UnsignedByteType;
-  }
   if (!rendererInstance.capabilities.isWebGL2) {
     return THREE.UnsignedByteType;
   }
@@ -184,8 +213,8 @@ function resize() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   if (displayMat) {
     displayMat.uniforms.uResolution.value.set(w, h);
-    displayMat.uniforms.uHandRadius.value = VISUAL.handRadiusPx;
   }
+  applyVisualUniforms();
   updateSimResolutionUniforms();
 }
 
@@ -507,6 +536,7 @@ function initShaders() {
       uCA: { value: VISUAL.chromaticAberration },
       uGlassBlend: { value: VISUAL.glassBlend },
       uGlow: { value: VISUAL.glowStrength },
+      uFluidHandBoost: { value: VISUAL.fluidHandBoost },
     },
     vertexShader: FULLSCREEN_VS,
     fragmentShader: `
@@ -518,7 +548,7 @@ function initShaders() {
       uniform sampler2D uFlow;
       uniform sampler2D uTrail;
       uniform vec3 uFingers[12];
-      uniform int uFingerCount;
+      uniform float uFingerCount;
       uniform float uTime;
       uniform vec2 uResolution;
       uniform vec2 uSimResolution;
@@ -527,6 +557,7 @@ function initShaders() {
       uniform float uCA;
       uniform float uGlassBlend;
       uniform float uGlow;
+      uniform float uFluidHandBoost;
 
       varying vec2 vUv;
 
@@ -538,7 +569,7 @@ function initShaders() {
         vec2 px = uv * uResolution;
         float zone = 0.0;
         for (int i = 0; i < 12; i++) {
-          if (i >= uFingerCount) break;
+          if (float(i) >= uFingerCount) continue;
           vec3 f = uFingers[i];
           if (f.z < 0.02) continue;
           vec2 fp = f.xy * uResolution;
@@ -587,10 +618,10 @@ function initShaders() {
         float fluid = sampleFluid(uv);
         float meta = metaballEdge(fluid);
 
-        float effectMask = handZone * smoothstep(0.004, 0.12, fluid + handZone * 0.04);
+        float effectMask = handZone * smoothstep(0.002, 0.1, fluid + handZone * uFluidHandBoost);
         effectMask = clamp(effectMask, 0.0, 1.0);
 
-        if (effectMask < 0.001) {
+        if (effectMask < 0.0003) {
           gl_FragColor = vec4(camera, 1.0);
           return;
         }
@@ -625,7 +656,7 @@ function initShaders() {
 
 function initFluid() {
   const mobile = isMobileDevice();
-  const base = mobile ? 256 : 384;
+  const base = mobile ? 320 : 384;
   const aspect = window.innerWidth / Math.max(window.innerHeight, 1);
   simH = base;
   simW = Math.round(base * Math.min(Math.max(aspect, 0.65), 1.75));
@@ -688,6 +719,7 @@ function initThree() {
   initShaders();
   initDivergenceRT();
   updateSimResolutionUniforms();
+  applyVisualUniforms();
   resize();
 
   window.removeEventListener("resize", resize);
@@ -725,8 +757,9 @@ function updateSplatUniforms(time) {
     const p = points[i];
     if (!velPts[i]) velPts[i] = new THREE.Vector4();
 
+    const powerScale = isMobileDevice() ? 1.35 : 1.0;
     const power = p.active > 0.03
-      ? Math.min(0.25 + p.strength * 0.2 + p.active * 0.35, 1.0)
+      ? Math.min((0.25 + p.strength * 0.2 + p.active * 0.35) * powerScale, 1.2)
       : 0;
 
     if (power > 0.03) {
@@ -765,6 +798,7 @@ function updateDisplayUniforms() {
 }
 
 function stepFluid(dt, time) {
+  applyVisualUniforms();
   updateSplatUniforms(time);
 
   splatVelMat.uniforms.uVelocity.value = velocityPP.read.texture;
@@ -855,7 +889,7 @@ function processHands(results) {
   }
 
   const mobile = isMobileDevice();
-  const mult = mobile ? 1.2 : 1.0;
+  const mult = mobile ? 1.45 : 1.0;
   setStatus(`已识别 ${results.multiHandLandmarks.length} 只手 · 移动手指划过液态玻璃`);
 
   for (const landmarks of results.multiHandLandmarks) {
@@ -919,8 +953,8 @@ async function trackHands() {
   const mobile = isMobileDevice();
   frameCount++;
   if (mobile) {
-    if (frameCount % 4 !== 0) return;
-    if (Date.now() - lastHandsSendAt < 220) return;
+    if (frameCount % 3 !== 0) return;
+    if (Date.now() - lastHandsSendAt < 160) return;
   }
 
   handBusy = true;
