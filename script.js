@@ -35,8 +35,8 @@ function getVisual() {
     glassBlend: 0.92,
     glowStrength: 0.07,
     fluidHandBoost: 0.18,
-    minHandMask: 0.88,
-    splatDensityMul: 2.2,
+    minHandMask: 0.72,
+    splatDensityMul: 2.0,
   };
 }
 
@@ -55,7 +55,7 @@ function applyVisualUniforms() {
     displayMat.uniforms.uFluidHandBoost.value = v.fluidHandBoost;
   }
   if (displayMat.uniforms.uMinHandMask) {
-    displayMat.uniforms.uMinHandMask.value = v.minHandMask;
+    displayMat.uniforms.uMinHandMask.value = handEffectReady ? v.minHandMask : 0;
   }
   if (splatDenMat?.uniforms?.uDensityMul) {
     splatDenMat.uniforms.uDensityMul.value = v.splatDensityMul;
@@ -80,6 +80,8 @@ let lastHandsSendAt = 0;
 let handsReady = false;
 const handAnchor = new THREE.Vector2(0.5, 0.5);
 let handAnchorStrength = 0;
+let handDetectStreak = 0;
+let handEffectReady = false;
 let handsWarming = false;
 let frameCount = 0;
 let running = false;
@@ -251,6 +253,63 @@ function updateSimResolutionUniforms() {
 
 function mirrorX(x) {
   return 1.0 - x;
+}
+
+function needsVideoRotation() {
+  if (!isMobileDevice()) return false;
+  const vw = video.videoWidth || 1;
+  const vh = video.videoHeight || 1;
+  const { h: sh, w: sw } = getScreenSize();
+  return sh > sw && vw > vh;
+}
+
+function mapLandmark(lmX, lmY, vx = 0, vy = 0) {
+  let x = lmX;
+  let y = lmY;
+  let outVx = vx;
+  let outVy = vy;
+
+  if (needsVideoRotation()) {
+    x = lmY;
+    y = 1.0 - lmX;
+    outVx = -vy;
+    outVy = vx;
+  }
+
+  return {
+    x: mirrorX(x),
+    y,
+    vx: -outVx,
+    vy: outVy,
+  };
+}
+
+function isPlausibleHand(landmarks) {
+  const spread = Math.hypot(
+    landmarks[8].x - landmarks[4].x,
+    landmarks[8].y - landmarks[4].y
+  );
+  const palmWidth = Math.hypot(
+    landmarks[5].x - landmarks[17].x,
+    landmarks[5].y - landmarks[17].y
+  );
+  const palm = landmarks[PALM_INDEX];
+  const wrist = landmarks[0];
+  const palmAboveWrist = palm.y < wrist.y - 0.02;
+  return spread > 0.1 && palmWidth > 0.08 && palmAboveWrist;
+}
+
+function clearFluid() {
+  if (!renderer || !velocityPP) return;
+  velocityPP.clear(renderer);
+  densityPP.clear(renderer);
+  flowPP.clear(renderer);
+  trailPP.clear(renderer);
+  pressurePP.clear(renderer);
+  handAnchorStrength = 0;
+  handDetectStreak = 0;
+  handEffectReady = false;
+  pointCount = 0;
 }
 
 const MEDIAPIPE_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240";
@@ -922,43 +981,56 @@ function processHands(results) {
   }
 
   if (!results.multiHandLandmarks?.length) {
+    handDetectStreak = 0;
+    handEffectReady = false;
     setStatus("未检测到手部 — 请将手掌放入画面");
     return;
   }
 
   const mobile = isMobileDevice();
   const mult = mobile ? 1.45 : 1.0;
+  const landmarks = results.multiHandLandmarks[0];
+
+  if (!isPlausibleHand(landmarks)) {
+    handDetectStreak = 0;
+    handEffectReady = false;
+    setStatus("请将张开的手掌对准镜头");
+    return;
+  }
+
+  handDetectStreak++;
+  handEffectReady = handDetectStreak >= (mobile ? 3 : 1);
   setStatus(`已识别 ${results.multiHandLandmarks.length} 只手 · 移动手指划过液态玻璃`);
 
-  for (const landmarks of results.multiHandLandmarks) {
-    const palm = landmarks[PALM_INDEX];
-    const palmKey = `palm-${landmarks[0].x.toFixed(3)}`;
-    const pp = prevPositions.get(palmKey);
-    let pvx = 0;
-    let pvy = 0;
-    if (pp) {
-      pvx = palm.x - pp.x;
-      pvy = palm.y - pp.y;
-    }
-    prevPositions.set(palmKey, { x: palm.x, y: palm.y });
-    const palmSpeed = Math.hypot(pvx, pvy);
-    injectPoint(mirrorX(palm.x), palm.y, -pvx, pvy, (0.2 + palmSpeed * 25) * mult);
+  const palm = landmarks[PALM_INDEX];
+  const palmKey = `palm-${landmarks[0].x.toFixed(3)}`;
+  const pp = prevPositions.get(palmKey);
+  let pvx = 0;
+  let pvy = 0;
+  if (pp) {
+    pvx = palm.x - pp.x;
+    pvy = palm.y - pp.y;
+  }
+  prevPositions.set(palmKey, { x: palm.x, y: palm.y });
+  const palmSpeed = Math.hypot(pvx, pvy);
+  const palmPt = mapLandmark(palm.x, palm.y, pvx, pvy);
+  injectPoint(palmPt.x, palmPt.y, palmPt.vx, palmPt.vy, (0.2 + palmSpeed * 25) * mult);
 
-    for (const idx of TIP_INDICES) {
-      if (pointCount >= MAX_POINTS) break;
-      const lm = landmarks[idx];
-      const key = `t${idx}-${landmarks[0].x.toFixed(3)}`;
-      const prev = prevPositions.get(key);
-      let vx = 0;
-      let vy = 0;
-      if (prev) {
-        vx = lm.x - prev.x;
-        vy = lm.y - prev.y;
-      }
-      prevPositions.set(key, { x: lm.x, y: lm.y });
-      const speed = Math.hypot(vx, vy);
-      injectPoint(mirrorX(lm.x), lm.y, -vx, vy, (0.18 + speed * 35) * mult);
+  for (const idx of TIP_INDICES) {
+    if (pointCount >= MAX_POINTS) break;
+    const lm = landmarks[idx];
+    const key = `t${idx}-${landmarks[0].x.toFixed(3)}`;
+    const prev = prevPositions.get(key);
+    let vx = 0;
+    let vy = 0;
+    if (prev) {
+      vx = lm.x - prev.x;
+      vy = lm.y - prev.y;
     }
+    prevPositions.set(key, { x: lm.x, y: lm.y });
+    const speed = Math.hypot(vx, vy);
+    const tipPt = mapLandmark(lm.x, lm.y, vx, vy);
+    injectPoint(tipPt.x, tipPt.y, tipPt.vx, tipPt.vy, (0.18 + speed * 35) * mult);
   }
   updateHandAnchorFromPoints();
   updateDisplayUniforms();
@@ -973,8 +1045,8 @@ function initMediaPipe() {
   hands.setOptions(mobile ? {
     maxNumHands: 1,
     modelComplexity: 0,
-    minDetectionConfidence: 0.35,
-    minTrackingConfidence: 0.35,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.45,
   } : {
     maxNumHands: 2,
     modelComplexity: 1,
@@ -1175,10 +1247,13 @@ async function start(event) {
   overlay.classList.add("hidden");
   hud.classList.remove("hidden");
 
+  clearFluid();
   running = true;
   starting = false;
   frameCount = 0;
   handsReady = false;
+  handDetectStreak = 0;
+  handEffectReady = false;
   clock.start();
   animate();
   setTimeout(() => warmupHands(), 600);
