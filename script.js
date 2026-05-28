@@ -2,25 +2,23 @@
 
 const TIP_INDICES = [4, 8, 12, 16, 20];
 const PALM_INDEX = 9;
-const MAX_POINTS = 14;
-const TRAIL_DECAY = 0.9945;
-const DENSITY_DECAY = 0.991;
-const VELOCITY_DECAY = 0.972;
-const FLOW_DECAY = 0.993;
+const MAX_POINTS = 12;
 
-function getVisual() {
-  const mobile = isMobileDevice();
-  return {
-    handRadiusPx: mobile ? 280 : 200,
-    splatRadius: mobile ? 0.058 : 0.04,
-    trailRetain: mobile ? 0.62 : 0.48,
-    distortScale: mobile ? 0.045 : 0.022,
-    chromaticAberration: mobile ? 0.00035 : 0.0005,
-    glassBlend: mobile ? 0.82 : 0.68,
-    glowStrength: mobile ? 0.06 : 0.035,
-    fluidMix: mobile ? 0.25 : 0.45,
-  };
-}
+const TRAIL_DECAY = 0.994;
+const DENSITY_DECAY = 0.992;
+const VELOCITY_DECAY = 0.976;
+const FLOW_DECAY = 0.994;
+
+const VISUAL = {
+  handRadiusPx: 220,
+  splatRadius: 0.032,
+  smoothFactor: 0.38,
+  trailRetain: 0.52,
+  distortScale: 0.028,
+  chromaticAberration: 0.0008,
+  glassBlend: 0.72,
+  glowStrength: 0.04,
+};
 
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
@@ -38,26 +36,31 @@ let frameCount = 0;
 let running = false;
 let starting = false;
 let clock = null;
-let rtType = null;
 let simW = 256;
 let simH = 256;
 
 const points = Array.from({ length: MAX_POINTS }, () => ({
   x: 0.5, y: 0.5, vx: 0, vy: 0, strength: 0, active: 0,
 }));
-const fingerUniforms = Array.from({ length: 12 }, () => new THREE.Vector2(0.5, 0.5));
-let fingerDisplayCount = 0;
+const smoothed = Array.from({ length: MAX_POINTS }, () => ({
+  x: 0.5, y: 0.5, vx: 0, vy: 0,
+}));
 let pointCount = 0;
 let prevPositions = new Map();
 
 let velocityPP, densityPP, flowPP, trailPP, pressurePP;
-let displayRT, bloomRT, prevFrameRT;
 let splatVelMat, splatDenMat, advectVelMat, advectDenMat, flowMat, trailMat;
-let pressureMat, divMat, gradSubtractMat, displayMat, bloomMat, blurMat;
-let compositeMat, motionBlurMat, copyMat;
-let finalRT;
-
+let pressureMat, divMat, gradSubtractMat, displayMat;
+let divergenceRT;
 let orthoCam = null;
+
+const FULLSCREEN_VS = `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position, 1.0);
+  }
+`;
 
 function setStatus(text) {
   if (statusEl) statusEl.textContent = text;
@@ -116,13 +119,9 @@ function getRenderTargetType(rendererInstance) {
       return THREE.HalfFloatType;
     }
   } catch (e) {
-    /* use byte fallback */
+    /* byte fallback */
   }
   return THREE.UnsignedByteType;
-}
-
-function mirrorX(x) {
-  return 1.0 - x;
 }
 
 class PingPong {
@@ -146,10 +145,10 @@ class PingPong {
     this.write = t;
   }
 
-  clear(renderer, color = 0x000000) {
+  clear(renderer) {
     const prev = renderer.getRenderTarget();
     renderer.setRenderTarget(this.read);
-    renderer.setClearColor(color, 0);
+    renderer.setClearColor(0x000000, 0);
     renderer.clear();
     renderer.setRenderTarget(this.write);
     renderer.clear();
@@ -157,10 +156,10 @@ class PingPong {
   }
 }
 
-function blit(material, target) {
+function blit(material, target, resW, resH) {
   if (!renderer || !quad || !orthoCam) return;
   if (material.uniforms?.uResolution) {
-    material.uniforms.uResolution.value.set(simW, simH);
+    material.uniforms.uResolution.value.set(resW ?? simW, resH ?? simH);
   }
   const prev = renderer.getRenderTarget();
   renderer.setRenderTarget(target);
@@ -169,61 +168,79 @@ function blit(material, target) {
   renderer.setRenderTarget(prev);
 }
 
-const FULLSCREEN_VS = `
-  varying vec2 vUv;
-  void main() {
-    vUv = uv;
-    gl_Position = vec4(position, 1.0);
+function getScreenSize() {
+  return { w: window.innerWidth, h: window.innerHeight };
+}
+
+function resize() {
+  if (!renderer) return;
+  const { w, h } = getScreenSize();
+  renderer.setSize(w, h, false);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  if (displayMat) {
+    displayMat.uniforms.uResolution.value.set(w, h);
+    displayMat.uniforms.uHandRadius.value = VISUAL.handRadiusPx;
   }
-`;
+  updateSimResolutionUniforms();
+}
+
+function updateSimResolutionUniforms() {
+  const mats = [
+    splatVelMat, splatDenMat, advectVelMat, advectDenMat,
+    flowMat, trailMat, divMat, pressureMat, gradSubtractMat,
+  ];
+  for (const mat of mats) {
+    if (mat?.uniforms?.uResolution) {
+      mat.uniforms.uResolution.value.set(simW, simH);
+    }
+  }
+  if (displayMat?.uniforms?.uSimResolution) {
+    displayMat.uniforms.uSimResolution.value.set(simW, simH);
+  }
+}
+
+function mirrorX(x) {
+  return 1.0 - x;
+}
 
 function initShaders() {
   splatVelMat = new THREE.ShaderMaterial({
     uniforms: {
       uVelocity: { value: null },
-      uPoints: { value: new Array(MAX_POINTS).fill(new THREE.Vector4()) },
+      uPoints: { value: Array.from({ length: MAX_POINTS }, () => new THREE.Vector4()) },
       uPointCount: { value: 0 },
       uTime: { value: 0 },
-      uRadius: { value: getVisual().splatRadius },
+      uRadius: { value: VISUAL.splatRadius },
       uResolution: { value: new THREE.Vector2(simW, simH) },
     },
     vertexShader: FULLSCREEN_VS,
     fragmentShader: `
       precision highp float;
       uniform sampler2D uVelocity;
-      uniform vec4 uPoints[14];
+      uniform vec4 uPoints[12];
       uniform int uPointCount;
       uniform float uTime;
       uniform float uRadius;
       varying vec2 vUv;
 
       float gauss(float d, float r) {
-        return exp(-d * d / (r * r + 0.0001));
+        return exp(-d * d / (r * r + 1e-5));
       }
 
       void main() {
-        vec2 uv = vUv;
-        vec2 vel = texture2D(uVelocity, uv).xy;
-
-        for (int i = 0; i < 14; i++) {
+        vec2 vel = texture2D(uVelocity, vUv).xy;
+        for (int i = 0; i < 12; i++) {
           if (i >= uPointCount) break;
           vec4 p = uPoints[i];
-          float power = p.w;
-          if (power < 0.02) continue;
-
-          vec2 delta = uv - p.xy;
-          float dist = length(delta);
-          float r = uRadius * (0.65 + power * 0.5);
+          if (p.w < 0.02) continue;
+          vec2 d = vUv - p.xy;
+          float dist = length(d);
+          float r = uRadius * (0.5 + p.w * 0.2);
           float g = gauss(dist, r);
-
-          vec2 moveForce = p.zw * 12.0;
-          vec2 dir = dist > 0.0005 ? delta / dist : vec2(0.0);
-          vec2 tangent = vec2(-dir.y, dir.x);
-          vec2 swirl = tangent * 0.4 * sin(uTime * 4.5 + float(i) * 0.7);
-
-          vel += (moveForce + swirl) * g * power;
+          vec2 force = p.zw * 5.0;
+          vec2 tan = vec2(-d.y, d.x) / max(dist, 1e-4);
+          vel += (force + tan * 0.08 * sin(uTime * 3.0 + float(i))) * g * p.w * 0.5;
         }
-
         gl_FragColor = vec4(vel, 0.0, 1.0);
       }
     `,
@@ -232,46 +249,40 @@ function initShaders() {
   splatDenMat = new THREE.ShaderMaterial({
     uniforms: {
       uDensity: { value: null },
-      uPoints: { value: new Array(MAX_POINTS).fill(new THREE.Vector4()) },
+      uPoints: { value: Array.from({ length: MAX_POINTS }, () => new THREE.Vector4()) },
       uPointCount: { value: 0 },
       uTime: { value: 0 },
-      uRadius: { value: getVisual().splatRadius },
+      uRadius: { value: VISUAL.splatRadius },
       uResolution: { value: new THREE.Vector2(simW, simH) },
     },
     vertexShader: FULLSCREEN_VS,
     fragmentShader: `
       precision highp float;
       uniform sampler2D uDensity;
-      uniform vec4 uPoints[14];
+      uniform vec4 uPoints[12];
       uniform int uPointCount;
       uniform float uTime;
       uniform float uRadius;
       varying vec2 vUv;
 
       float gauss(float d, float r) {
-        return exp(-d * d / (r * r + 0.0001));
+        return exp(-d * d / (r * r + 1e-5));
       }
 
       void main() {
-        vec2 uv = vUv;
-        float dens = texture2D(uDensity, uv).r;
-
-        for (int i = 0; i < 14; i++) {
+        float dens = texture2D(uDensity, vUv).r;
+        for (int i = 0; i < 12; i++) {
           if (i >= uPointCount) break;
           vec4 p = uPoints[i];
-          float power = p.w;
-          if (power < 0.02) continue;
-
-          vec2 delta = uv - p.xy;
-          float dist = length(delta);
-          float r = uRadius * (0.65 + power * 0.5);
+          if (p.w < 0.02) continue;
+          vec2 d = vUv - p.xy;
+          float dist = length(d);
+          float r = uRadius * (0.5 + p.w * 0.18);
           float g = gauss(dist, r);
-          float gWide = gauss(dist, r * 2.5);
-
-          dens += g * (0.22 + power * 0.16);
-          dens += gWide * 0.08 * power;
+          float gW = gauss(dist, r * 1.6);
+          dens += g * (0.045 + p.w * 0.03);
+          dens += sin(dist * 70.0 - uTime * 7.0) * gW * 0.022 * p.w;
         }
-
         gl_FragColor = vec4(dens, dens, dens, 1.0);
       }
     `,
@@ -292,15 +303,11 @@ function initShaders() {
       uniform sampler2D uSource;
       uniform float uDt;
       uniform float uDecay;
-      uniform vec2 uResolution;
       varying vec2 vUv;
-
       void main() {
         vec2 vel = texture2D(uVelocity, vUv).xy;
-        vec2 uv = vUv - vel * uDt * 1.6;
-        uv = clamp(uv, 0.002, 0.998);
-        vec2 outVel = texture2D(uSource, uv).xy * uDecay;
-        gl_FragColor = vec4(outVel, 0.0, 1.0);
+        vec2 uv = clamp(vUv - vel * uDt * 1.5, 0.002, 0.998);
+        gl_FragColor = vec4(texture2D(uSource, uv).xy * uDecay, 0.0, 1.0);
       }
     `,
   });
@@ -320,13 +327,10 @@ function initShaders() {
       uniform sampler2D uSource;
       uniform float uDt;
       uniform float uDecay;
-      uniform vec2 uResolution;
       varying vec2 vUv;
-
       void main() {
         vec2 vel = texture2D(uVelocity, vUv).xy;
-        vec2 uv = vUv - vel * uDt * 1.4;
-        uv = clamp(uv, 0.002, 0.998);
+        vec2 uv = clamp(vUv - vel * uDt * 1.3, 0.002, 0.998);
         float d = texture2D(uSource, uv).r * uDecay;
         gl_FragColor = vec4(d, d, d, 1.0);
       }
@@ -347,16 +351,12 @@ function initShaders() {
       uniform sampler2D uVelocity;
       uniform float uDecay;
       varying vec2 vUv;
-
       void main() {
-        vec2 prevFlow = texture2D(uFlow, vUv).xy * uDecay;
-        vec2 vel = texture2D(uVelocity, vUv).xy;
-        float speed = length(vel);
-        vec2 dir = speed > 0.0001 ? vel / speed : vec2(0.0);
-        vec2 flow = prevFlow + dir * speed * 0.55;
-        flow = clamp(flow, -2.0, 2.0);
-        float mag = length(flow);
-        gl_FragColor = vec4(flow, mag, 1.0);
+        vec2 f = texture2D(uFlow, vUv).xy * uDecay;
+        vec2 v = texture2D(uVelocity, vUv).xy;
+        float sp = length(v);
+        f += (sp > 1e-4 ? normalize(v) * sp * 0.3 : vec2(0.0));
+        gl_FragColor = vec4(clamp(f, -1.5, 1.5), length(f), 1.0);
       }
     `,
   });
@@ -366,7 +366,7 @@ function initShaders() {
       uTrail: { value: null },
       uDensity: { value: null },
       uDecay: { value: TRAIL_DECAY },
-      uRetain: { value: getVisual().trailRetain },
+      uRetain: { value: VISUAL.trailRetain },
       uResolution: { value: new THREE.Vector2(simW, simH) },
     },
     vertexShader: FULLSCREEN_VS,
@@ -377,12 +377,11 @@ function initShaders() {
       uniform float uDecay;
       uniform float uRetain;
       varying vec2 vUv;
-
       void main() {
         float prev = texture2D(uTrail, vUv).r * uDecay;
         float dens = texture2D(uDensity, vUv).r;
-        float trail = max(prev, dens * uRetain);
-        gl_FragColor = vec4(trail, trail, trail, 1.0);
+        float t = max(prev, dens * uRetain);
+        gl_FragColor = vec4(t, t, t, 1.0);
       }
     `,
   });
@@ -404,8 +403,7 @@ function initShaders() {
         float r = texture2D(uVelocity, vUv + vec2(t.x, 0.0)).x;
         float b = texture2D(uVelocity, vUv - vec2(0.0, t.y)).y;
         float tp = texture2D(uVelocity, vUv + vec2(0.0, t.y)).y;
-        float div = (r - l + tp - b) * 0.5;
-        gl_FragColor = vec4(div, 0.0, 0.0, 1.0);
+        gl_FragColor = vec4((r - l + tp - b) * 0.5, 0.0, 0.0, 1.0);
       }
     `,
   });
@@ -423,16 +421,14 @@ function initShaders() {
       uniform sampler2D uDivergence;
       uniform vec2 uResolution;
       varying vec2 vUv;
-
       void main() {
-        vec2 texel = 1.0 / uResolution;
-        float pL = texture2D(uPressure, vUv - vec2(texel.x, 0.0)).x;
-        float pR = texture2D(uPressure, vUv + vec2(texel.x, 0.0)).x;
-        float pB = texture2D(uPressure, vUv - vec2(0.0, texel.y)).x;
-        float pT = texture2D(uPressure, vUv + vec2(0.0, texel.y)).x;
+        vec2 t = 1.0 / uResolution;
+        float pL = texture2D(uPressure, vUv - vec2(t.x, 0.0)).x;
+        float pR = texture2D(uPressure, vUv + vec2(t.x, 0.0)).x;
+        float pB = texture2D(uPressure, vUv - vec2(0.0, t.y)).x;
+        float pT = texture2D(uPressure, vUv + vec2(0.0, t.y)).x;
         float div = texture2D(uDivergence, vUv).x;
-        float p = (pL + pR + pB + pT - div) * 0.25;
-        gl_FragColor = vec4(p, 0.0, 0.0, 1.0);
+        gl_FragColor = vec4((pL + pR + pB + pT - div) * 0.25, 0.0, 0.0, 1.0);
       }
     `,
   });
@@ -457,7 +453,7 @@ function initShaders() {
         float pB = texture2D(uPressure, vUv - vec2(0.0, t.y)).x;
         float pT = texture2D(uPressure, vUv + vec2(0.0, t.y)).x;
         vec2 vel = texture2D(uVelocity, vUv).xy;
-        vel -= vec2(pR - pL, pT - pB) * 0.55;
+        vel -= vec2(pR - pL, pT - pB) * 0.5;
         gl_FragColor = vec4(vel, 0.0, 1.0);
       }
     `,
@@ -470,17 +466,16 @@ function initShaders() {
       uDensity: { value: null },
       uFlow: { value: null },
       uTrail: { value: null },
+      uFingers: { value: Array.from({ length: MAX_POINTS }, () => new THREE.Vector3()) },
+      uFingerCount: { value: 0 },
       uTime: { value: 0 },
       uResolution: { value: new THREE.Vector2(1, 1) },
       uSimResolution: { value: new THREE.Vector2(simW, simH) },
-      uFingers: { value: fingerUniforms },
-      uFingerCount: { value: 0 },
-      uHandRadius: { value: getVisual().handRadiusPx },
-      uDistortScale: { value: getVisual().distortScale },
-      uChromaticAberration: { value: getVisual().chromaticAberration },
-      uGlassBlend: { value: getVisual().glassBlend },
-      uGlowStrength: { value: getVisual().glowStrength },
-      uFluidMix: { value: getVisual().fluidMix },
+      uHandRadius: { value: VISUAL.handRadiusPx },
+      uDistortScale: { value: VISUAL.distortScale },
+      uCA: { value: VISUAL.chromaticAberration },
+      uGlassBlend: { value: VISUAL.glassBlend },
+      uGlow: { value: VISUAL.glowStrength },
     },
     vertexShader: FULLSCREEN_VS,
     fragmentShader: `
@@ -491,222 +486,120 @@ function initShaders() {
       uniform sampler2D uDensity;
       uniform sampler2D uFlow;
       uniform sampler2D uTrail;
+      uniform vec3 uFingers[12];
+      uniform int uFingerCount;
       uniform float uTime;
       uniform vec2 uResolution;
       uniform vec2 uSimResolution;
-      uniform vec2 uFingers[12];
-      uniform float uFingerCount;
       uniform float uHandRadius;
       uniform float uDistortScale;
-      uniform float uChromaticAberration;
+      uniform float uCA;
       uniform float uGlassBlend;
-      uniform float uGlowStrength;
-      uniform float uFluidMix;
+      uniform float uGlow;
 
       varying vec2 vUv;
 
-      vec2 mirrorUv(vec2 uv) {
+      vec2 videoUv(vec2 uv) {
         return vec2(1.0 - uv.x, uv.y);
       }
 
-      float sampleDensity(vec2 uv) {
-        return texture2D(uDensity, uv).r;
-      }
-
-      vec2 gradient(vec2 uv) {
-        vec2 t = 1.0 / uSimResolution;
-        float l = sampleDensity(uv - vec2(t.x, 0.0));
-        float r = sampleDensity(uv + vec2(t.x, 0.0));
-        float b = sampleDensity(uv - vec2(0.0, t.y));
-        float top = sampleDensity(uv + vec2(0.0, t.y));
-        return vec2(r - l, top - b);
-      }
-
-      float handProximity(vec2 screenUv) {
-        float minDist = 1e5;
+      float handProximity(vec2 uv) {
+        vec2 px = uv * uResolution;
+        float zone = 0.0;
         for (int i = 0; i < 12; i++) {
-          if (float(i) >= uFingerCount) continue;
-          vec2 delta = (screenUv - uFingers[i]) * uResolution;
-          minDist = min(minDist, length(delta));
+          if (i >= uFingerCount) break;
+          vec3 f = uFingers[i];
+          if (f.z < 0.02) continue;
+          vec2 fp = f.xy * uResolution;
+          float d = length(px - fp);
+          float inner = uHandRadius * 0.45;
+          float outer = uHandRadius;
+          zone = max(zone, 1.0 - smoothstep(inner, outer, d));
         }
-        return 1.0 - smoothstep(uHandRadius * 0.35, uHandRadius * 1.05, minDist);
+        return zone;
       }
 
-      vec3 sampleVideo(vec2 uv, vec2 offset, float ca) {
-        vec2 suv = mirrorUv(uv + offset);
-        float r = texture2D(uVideo, suv + vec2(ca, 0.0)).r;
-        float g = texture2D(uVideo, suv).g;
-        float b = texture2D(uVideo, suv - vec2(ca, 0.0)).b;
+      float sampleFluid(vec2 uv) {
+        float d = texture2D(uDensity, uv).r;
+        float t = texture2D(uTrail, uv).r;
+        return max(d, t * 0.85);
+      }
+
+      vec2 fluidGradient(vec2 uv) {
+        vec2 t = 1.0 / uSimResolution;
+        float l = sampleFluid(uv - vec2(t.x, 0.0));
+        float r = sampleFluid(uv + vec2(t.x, 0.0));
+        float b = sampleFluid(uv - vec2(0.0, t.y));
+        float tp = sampleFluid(uv + vec2(0.0, t.y));
+        return vec2(r - l, tp - b);
+      }
+
+      float metaballEdge(float f) {
+        float blob = smoothstep(0.02, 0.14, f);
+        float edge = smoothstep(0.06, 0.18, f) - smoothstep(0.18, 0.35, f);
+        return blob * 0.4 + edge * 0.6;
+      }
+
+      vec3 sampleVideo(vec2 uv, vec2 off, float ca) {
+        vec2 base = videoUv(uv);
+        float r = texture2D(uVideo, videoUv(uv + off + vec2(ca, 0.0))).r;
+        float g = texture2D(uVideo, videoUv(uv + off)).g;
+        float b = texture2D(uVideo, videoUv(uv + off - vec2(ca, 0.0))).b;
         return vec3(r, g, b);
       }
 
       void main() {
         vec2 uv = vUv;
-        vec2 simUv = uv;
-        vec2 mUv = mirrorUv(uv);
+        vec3 camera = sampleVideo(uv, vec2(0.0), 0.0);
 
-        float handMask = handProximity(uv);
-        float d = texture2D(uDensity, simUv).r;
-        float trail = texture2D(uTrail, simUv).r;
-        float localFluid = smoothstep(0.004, 0.12, max(d, trail * 0.75));
-        float effectMask = handMask * (1.0 - uFluidMix + localFluid * uFluidMix);
+        float handZone = handProximity(uv);
+        float fluid = sampleFluid(uv);
+        float meta = metaballEdge(fluid);
 
-        vec2 vel = texture2D(uVelocity, simUv).xy;
-        vec2 flow = texture2D(uFlow, simUv).xy;
-        vec2 grad = gradient(simUv);
+        float effectMask = handZone * smoothstep(0.004, 0.12, fluid + handZone * 0.04);
+        effectMask = clamp(effectMask, 0.0, 1.0);
 
-        float fluidAmp = handMask * (0.35 + localFluid * 0.65);
-        vec2 distort = (vel * 0.35 + flow * 0.28 + grad * 0.25) * uDistortScale * fluidAmp;
-
-        float ca = uChromaticAberration * length(distort) * 8.0;
-        vec3 rawVideo = texture2D(uVideo, mUv).rgb;
-
-        if (effectMask < 0.01) {
-          gl_FragColor = vec4(rawVideo, 1.0);
+        if (effectMask < 0.001) {
+          gl_FragColor = vec4(camera, 1.0);
           return;
         }
 
-        vec3 glassCol = sampleVideo(uv, distort, ca);
-        float blend = uGlassBlend * effectMask;
-        vec3 col = mix(rawVideo, glassCol, blend);
+        vec2 vel = texture2D(uVelocity, uv).xy;
+        vec2 flow = texture2D(uFlow, uv).xy;
+        vec2 grad = fluidGradient(uv);
+        float trail = texture2D(uTrail, uv).r;
 
-        float edge = smoothstep(0.03, 0.18, localFluid) * (1.0 - smoothstep(0.18, 0.42, localFluid));
-        col += vec3(0.0, 0.75, 0.9) * edge * handMask * uGlowStrength;
+        vec2 distort = (vel * 0.6 + flow * 0.35 + grad * 0.5) * uDistortScale;
+        distort += grad * meta * uDistortScale * 0.8;
+        float ripple = sin(trail * 22.0 - uTime * 4.0) * trail * 0.004;
+        distort += grad * ripple;
+        float dLen = length(distort);
+        distort *= min(1.0, uDistortScale * 1.2 / max(dLen, 1e-4));
 
-        float vignette = 1.0 - dot((uv - 0.5) * 1.1, (uv - 0.5) * 1.1);
-        col *= 0.9 + vignette * 0.1;
+        float ca = uCA * (1.0 + dLen * 40.0);
+        vec3 glass = sampleVideo(uv, distort * effectMask, ca * effectMask);
+
+        float fresnel = pow(1.0 - meta, 2.0) * meta;
+        vec3 tint = vec3(0.55, 0.78, 0.92) * fresnel * uGlow;
+        float rippleRing = sin(length(grad) * 40.0 - uTime * 5.0) * 0.5 + 0.5;
+        tint += vec3(0.4, 0.65, 0.85) * rippleRing * trail * uGlow * 0.5;
+
+        vec3 col = mix(camera, glass + tint, effectMask * uGlassBlend);
 
         gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
       }
-    `,
-  });
-
-  bloomMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uTexture: { value: null },
-      uResolution: { value: new THREE.Vector2(1, 1) },
-      uThreshold: { value: 0.55 },
-    },
-    vertexShader: FULLSCREEN_VS,
-    fragmentShader: `
-      precision highp float;
-      uniform sampler2D uTexture;
-      uniform vec2 uResolution;
-      uniform float uThreshold;
-      varying vec2 vUv;
-
-      void main() {
-        vec3 col = texture2D(uTexture, vUv).rgb;
-        float lum = max(max(col.r, col.g), col.b);
-        vec3 bloom = col * smoothstep(uThreshold, uThreshold + 0.35, lum);
-        gl_FragColor = vec4(bloom, 1.0);
-      }
-    `,
-  });
-
-  blurMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uTexture: { value: null },
-      uResolution: { value: new THREE.Vector2(1, 1) },
-      uDirection: { value: new THREE.Vector2(1, 0) },
-    },
-    vertexShader: FULLSCREEN_VS,
-    fragmentShader: `
-      precision highp float;
-      uniform sampler2D uTexture;
-      uniform vec2 uResolution;
-      uniform vec2 uDirection;
-      varying vec2 vUv;
-
-      void main() {
-        vec2 texel = uDirection / uResolution;
-        vec3 sum = vec3(0.0);
-        sum += texture2D(uTexture, vUv - 4.0 * texel).rgb * 0.05;
-        sum += texture2D(uTexture, vUv - 3.0 * texel).rgb * 0.09;
-        sum += texture2D(uTexture, vUv - 2.0 * texel).rgb * 0.12;
-        sum += texture2D(uTexture, vUv - texel).rgb * 0.15;
-        sum += texture2D(uTexture, vUv).rgb * 0.18;
-        sum += texture2D(uTexture, vUv + texel).rgb * 0.15;
-        sum += texture2D(uTexture, vUv + 2.0 * texel).rgb * 0.12;
-        sum += texture2D(uTexture, vUv + 3.0 * texel).rgb * 0.09;
-        sum += texture2D(uTexture, vUv + 4.0 * texel).rgb * 0.05;
-        gl_FragColor = vec4(sum, 1.0);
-      }
-    `,
-  });
-
-  motionBlurMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uCurrent: { value: null },
-      uPrev: { value: null },
-      uVelocity: { value: null },
-      uBlend: { value: 0.22 },
-      uResolution: { value: new THREE.Vector2(1, 1) },
-      uSimResolution: { value: new THREE.Vector2(simW, simH) },
-    },
-    vertexShader: FULLSCREEN_VS,
-    fragmentShader: `
-      precision highp float;
-      uniform sampler2D uCurrent;
-      uniform sampler2D uPrev;
-      uniform sampler2D uVelocity;
-      uniform float uBlend;
-      uniform vec2 uResolution;
-      uniform vec2 uSimResolution;
-      varying vec2 vUv;
-
-      void main() {
-        vec2 vel = texture2D(uVelocity, vUv).xy;
-        vec2 off = vel / uSimResolution * 3.5;
-        vec3 prev = texture2D(uPrev, vUv - off).rgb;
-        vec3 cur = texture2D(uCurrent, vUv).rgb;
-        vec3 col = mix(cur, prev, uBlend);
-        gl_FragColor = vec4(col, 1.0);
-      }
-    `,
-  });
-
-  compositeMat = new THREE.ShaderMaterial({
-    uniforms: {
-      uBase: { value: null },
-      uBloom: { value: null },
-      uBloomStrength: { value: 0.7 },
-    },
-    vertexShader: FULLSCREEN_VS,
-    fragmentShader: `
-      precision highp float;
-      uniform sampler2D uBase;
-      uniform sampler2D uBloom;
-      uniform float uBloomStrength;
-      varying vec2 vUv;
-      void main() {
-        vec3 base = texture2D(uBase, vUv).rgb;
-        vec3 bloom = texture2D(uBloom, vUv).rgb;
-        gl_FragColor = vec4(base + bloom * uBloomStrength, 1.0);
-      }
-    `,
-  });
-
-  copyMat = new THREE.ShaderMaterial({
-    uniforms: { uTexture: { value: null } },
-    vertexShader: FULLSCREEN_VS,
-    fragmentShader: `
-      precision highp float;
-      uniform sampler2D uTexture;
-      varying vec2 vUv;
-      void main() { gl_FragColor = texture2D(uTexture, vUv); }
     `,
   });
 }
 
 function initFluid() {
   const mobile = isMobileDevice();
-  const base = mobile ? 256 : 320;
+  const base = mobile ? 256 : 384;
   const aspect = window.innerWidth / Math.max(window.innerHeight, 1);
   simH = base;
-  simW = Math.round(base * Math.min(Math.max(aspect, 0.6), 1.8));
+  simW = Math.round(base * Math.min(Math.max(aspect, 0.65), 1.75));
 
-  rtType = getRenderTargetType(renderer);
+  const rtType = getRenderTargetType(renderer);
 
   velocityPP = new PingPong(simW, simH, { type: rtType });
   densityPP = new PingPong(simW, simH, { type: rtType });
@@ -714,33 +607,20 @@ function initFluid() {
   trailPP = new PingPong(simW, simH, { type: rtType });
   pressurePP = new PingPong(simW, simH, { type: rtType });
 
-  const screenType = THREE.UnsignedByteType;
-  displayRT = new THREE.WebGLRenderTarget(
-    window.innerWidth,
-    window.innerHeight,
-    { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, type: screenType }
-  );
-  bloomRT = new THREE.WebGLRenderTarget(
-    window.innerWidth,
-    window.innerHeight,
-    { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, type: screenType }
-  );
-  prevFrameRT = new THREE.WebGLRenderTarget(
-    window.innerWidth,
-    window.innerHeight,
-    { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, type: screenType }
-  );
-  finalRT = new THREE.WebGLRenderTarget(
-    window.innerWidth,
-    window.innerHeight,
-    { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, type: screenType }
-  );
-
   velocityPP.clear(renderer);
   densityPP.clear(renderer);
   flowPP.clear(renderer);
   trailPP.clear(renderer);
   pressurePP.clear(renderer);
+}
+
+function initDivergenceRT() {
+  const type = getRenderTargetType(renderer);
+  divergenceRT = new THREE.WebGLRenderTarget(simW, simH, {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    type,
+  });
 }
 
 function initThree() {
@@ -756,7 +636,6 @@ function initThree() {
     powerPreference: "high-performance",
   });
   renderer.setClearColor(0x000000, 1);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
   scene = new THREE.Scene();
   camera = orthoCam;
@@ -764,20 +643,22 @@ function initThree() {
   videoTexture = new THREE.VideoTexture(video);
   videoTexture.minFilter = THREE.LinearFilter;
   videoTexture.magFilter = THREE.LinearFilter;
-  videoTexture.flipY = true;
   if (THREE.SRGBColorSpace) {
     videoTexture.colorSpace = THREE.SRGBColorSpace;
   }
 
-  const geometry = new THREE.PlaneGeometry(2, 2);
-  quad = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial());
+  quad = new THREE.Mesh(
+    new THREE.PlaneGeometry(2, 2),
+    new THREE.MeshBasicMaterial()
+  );
   scene.add(quad);
 
   initFluid();
   initShaders();
   initDivergenceRT();
-
+  updateSimResolutionUniforms();
   resize();
+
   window.removeEventListener("resize", resize);
   window.addEventListener("resize", resize);
   window.removeEventListener("orientationchange", onOrientationChange);
@@ -788,59 +669,16 @@ function onOrientationChange() {
   setTimeout(resize, 200);
 }
 
-function resize() {
-  if (!renderer) return;
-
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-
-  renderer.setSize(w, h, false);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-
-  if (displayRT) {
-    displayRT.setSize(w, h);
-    bloomRT.setSize(w, h);
-    prevFrameRT.setSize(w, h);
-    finalRT.setSize(w, h);
-  }
-
-  if (displayMat?.uniforms?.uResolution) {
-    displayMat.uniforms.uResolution.value.set(w, h);
-  }
-  if (bloomMat?.uniforms?.uResolution) {
-    bloomMat.uniforms.uResolution.value.set(w, h);
-  }
-  if (blurMat?.uniforms?.uResolution) {
-    blurMat.uniforms.uResolution.value.set(w, h);
-  }
-  if (motionBlurMat?.uniforms?.uResolution) {
-    motionBlurMat.uniforms.uResolution.value.set(w, h);
-  }
-}
-
-let divergenceRT;
-
-function initDivergenceRT() {
-  divergenceRT = new THREE.WebGLRenderTarget(simW, simH, {
-    minFilter: THREE.LinearFilter,
-    magFilter: THREE.LinearFilter,
-    type: rtType || THREE.UnsignedByteType,
-  });
-}
-
 function projectVelocity() {
   divMat.uniforms.uVelocity.value = velocityPP.read.texture;
   blit(divMat, divergenceRT);
-
   pressurePP.clear(renderer);
-
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 10; i++) {
     pressureMat.uniforms.uPressure.value = pressurePP.read.texture;
     pressureMat.uniforms.uDivergence.value = divergenceRT.texture;
     blit(pressureMat, pressurePP.write);
     pressurePP.swap();
   }
-
   gradSubtractMat.uniforms.uPressure.value = pressurePP.read.texture;
   gradSubtractMat.uniforms.uVelocity.value = velocityPP.read.texture;
   blit(gradSubtractMat, velocityPP.write);
@@ -848,28 +686,27 @@ function projectVelocity() {
 }
 
 function updateSplatUniforms(time) {
-  const velPoints = splatVelMat.uniforms.uPoints.value;
-  const denPoints = splatDenMat.uniforms.uPoints.value;
+  const velPts = splatVelMat.uniforms.uPoints.value;
+  const denPts = splatDenMat.uniforms.uPoints.value;
   let count = 0;
 
   for (let i = 0; i < MAX_POINTS; i++) {
     const p = points[i];
-    if (!velPoints[i]) velPoints[i] = new THREE.Vector4();
-    if (!denPoints[i]) denPoints[i] = new THREE.Vector4();
+    if (!velPts[i]) velPts[i] = new THREE.Vector4();
 
-    const powerBoost = isMobileDevice() ? 1.25 : 1.0;
-    const power = p.active > 0.02
-      ? Math.min((0.45 + p.strength + p.active * 0.4) * powerBoost, 2.8)
+    const power = p.active > 0.03
+      ? Math.min(0.25 + p.strength * 0.2 + p.active * 0.35, 1.0)
       : 0;
 
-    if (power > 0.02) {
-      velPoints[i].set(p.x, 1.0 - p.y, p.vx, -p.vy);
-      velPoints[i].w = power;
-      denPoints[i].copy(velPoints[i]);
+    if (power > 0.03) {
+      const simY = 1.0 - p.y;
+      velPts[i].set(p.x, simY, p.vx, -p.vy);
+      velPts[i].w = power;
+      denPts[i].copy(velPts[i]);
       count++;
     } else {
-      velPoints[i].set(0, 0, 0, 0);
-      denPoints[i].set(0, 0, 0, 0);
+      velPts[i].set(0, 0, 0, 0);
+      denPts[i].set(0, 0, 0, 0);
     }
   }
 
@@ -879,10 +716,24 @@ function updateSplatUniforms(time) {
   splatDenMat.uniforms.uTime.value = time;
 }
 
+function updateDisplayUniforms() {
+  const fingers = displayMat.uniforms.uFingers.value;
+  let count = 0;
+
+  for (let i = 0; i < MAX_POINTS; i++) {
+    if (!fingers[i]) fingers[i] = new THREE.Vector3();
+    const p = points[i];
+    if (p.active > 0.03) {
+      fingers[i].set(p.x, 1.0 - p.y, p.active);
+      count++;
+    } else {
+      fingers[i].set(0, 0, 0);
+    }
+  }
+  displayMat.uniforms.uFingerCount.value = count;
+}
+
 function stepFluid(dt, time) {
-  const v = getVisual();
-  splatVelMat.uniforms.uRadius.value = v.splatRadius;
-  splatDenMat.uniforms.uRadius.value = v.splatRadius;
   updateSplatUniforms(time);
 
   splatVelMat.uniforms.uVelocity.value = velocityPP.read.texture;
@@ -898,14 +749,12 @@ function stepFluid(dt, time) {
   advectVelMat.uniforms.uVelocity.value = velocityPP.read.texture;
   advectVelMat.uniforms.uSource.value = velocityPP.read.texture;
   advectVelMat.uniforms.uDt.value = dt;
-  advectVelMat.uniforms.uDecay.value = VELOCITY_DECAY;
   blit(advectVelMat, velocityPP.write);
   velocityPP.swap();
 
   advectDenMat.uniforms.uVelocity.value = velocityPP.read.texture;
   advectDenMat.uniforms.uSource.value = densityPP.read.texture;
   advectDenMat.uniforms.uDt.value = dt;
-  advectDenMat.uniforms.uDecay.value = DENSITY_DECAY;
   blit(advectDenMat, densityPP.write);
   densityPP.swap();
 
@@ -916,72 +765,57 @@ function stepFluid(dt, time) {
 
   trailMat.uniforms.uTrail.value = trailPP.read.texture;
   trailMat.uniforms.uDensity.value = densityPP.read.texture;
-  trailMat.uniforms.uRetain.value = getVisual().trailRetain;
   blit(trailMat, trailPP.write);
   trailPP.swap();
 }
 
-function pushFingerDisplay(x, y) {
-  if (fingerDisplayCount >= fingerUniforms.length) return;
-  fingerUniforms[fingerDisplayCount].set(mirrorX(x), y);
-  fingerDisplayCount++;
-}
-
-function updateDisplayUniforms() {
-  if (!displayMat) return;
-  const v = getVisual();
-  displayMat.uniforms.uFingerCount.value = fingerDisplayCount;
-  displayMat.uniforms.uHandRadius.value = v.handRadiusPx;
-  displayMat.uniforms.uDistortScale.value = v.distortScale;
-  displayMat.uniforms.uChromaticAberration.value = v.chromaticAberration;
-  displayMat.uniforms.uGlassBlend.value = v.glassBlend;
-  displayMat.uniforms.uGlowStrength.value = v.glowStrength;
-  displayMat.uniforms.uFluidMix.value = v.fluidMix;
-}
-
 function renderFrame(dt, time) {
-  if (!renderer || !displayMat || !quad) return;
+  if (!renderer || !displayMat) return;
+
   stepFluid(dt, time);
   updateDisplayUniforms();
 
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-
+  const { w, h } = getScreenSize();
   displayMat.uniforms.uVideo.value = videoTexture;
   displayMat.uniforms.uVelocity.value = velocityPP.read.texture;
   displayMat.uniforms.uDensity.value = densityPP.read.texture;
   displayMat.uniforms.uFlow.value = flowPP.read.texture;
   displayMat.uniforms.uTrail.value = trailPP.read.texture;
   displayMat.uniforms.uTime.value = time;
-  displayMat.uniforms.uResolution.value.set(w, h);
-  displayMat.uniforms.uSimResolution.value.set(simW, simH);
 
   const prev = renderer.getRenderTarget();
   renderer.setRenderTarget(null);
   quad.material = displayMat;
-  renderer.render(scene, orthoCam);
+  renderer.render(scene, camera);
   renderer.setRenderTarget(prev);
 }
 
-function injectPoint(x, y, vx, vy, strength) {
+function injectPoint(mx, y, vx, vy, strength) {
   if (pointCount >= MAX_POINTS) return;
+
+  const s = smoothed[pointCount];
+  const t = VISUAL.smoothFactor;
+  s.x += (mx - s.x) * t;
+  s.y += (y - s.y) * t;
+  s.vx += (vx - s.vx) * t;
+  s.vy += (vy - s.vy) * t;
+
   const p = points[pointCount];
-  p.x = x;
-  p.y = y;
-  p.vx = vx;
-  p.vy = vy;
+  p.x = s.x;
+  p.y = s.y;
+  p.vx = s.vx;
+  p.vy = s.vy;
   p.strength = strength;
-  p.active = Math.min(p.active * 0.88 + strength * 0.25, 1.0);
+  p.active = Math.min(p.active * 0.94 + strength * 0.15 + 0.08, 1.0);
   pointCount++;
 }
 
 function processHands(results) {
   pointCount = 0;
-  fingerDisplayCount = 0;
   for (let i = 0; i < MAX_POINTS; i++) {
-    points[i].active *= 0.985;
-    points[i].vx *= 0.85;
-    points[i].vy *= 0.85;
+    points[i].active *= 0.99;
+    points[i].vx *= 0.88;
+    points[i].vy *= 0.88;
   }
 
   if (!results.multiHandLandmarks?.length) {
@@ -990,28 +824,27 @@ function processHands(results) {
   }
 
   const mobile = isMobileDevice();
-  const strengthMult = mobile ? 1.85 : 1.0;
-  setStatus(`已识别 ${results.multiHandLandmarks.length} 只手 · 缓慢移动手指感受液态拖尾`);
+  const mult = mobile ? 1.2 : 1.0;
+  setStatus(`已识别 ${results.multiHandLandmarks.length} 只手 · 移动手指划过液态玻璃`);
 
   for (const landmarks of results.multiHandLandmarks) {
     const palm = landmarks[PALM_INDEX];
-    const palmKey = `palm-${landmarks[0].x.toFixed(2)}`;
-    const prevPalm = prevPositions.get(palmKey);
+    const palmKey = `palm-${landmarks[0].x.toFixed(3)}`;
+    const pp = prevPositions.get(palmKey);
     let pvx = 0;
     let pvy = 0;
-    if (prevPalm) {
-      pvx = palm.x - prevPalm.x;
-      pvy = palm.y - prevPalm.y;
+    if (pp) {
+      pvx = palm.x - pp.x;
+      pvy = palm.y - pp.y;
     }
     prevPositions.set(palmKey, { x: palm.x, y: palm.y });
-    const palmSpeed = Math.sqrt(pvx * pvx + pvy * pvy);
-    pushFingerDisplay(palm.x, palm.y);
-    injectPoint(mirrorX(palm.x), palm.y, -pvx, pvy, (0.4 + palmSpeed * 45) * strengthMult);
+    const palmSpeed = Math.hypot(pvx, pvy);
+    injectPoint(mirrorX(palm.x), palm.y, -pvx, pvy, (0.2 + palmSpeed * 25) * mult);
 
-    for (let t = 0; t < TIP_INDICES.length; t++) {
-      const idx = TIP_INDICES[t];
+    for (const idx of TIP_INDICES) {
+      if (pointCount >= MAX_POINTS) break;
       const lm = landmarks[idx];
-      const key = `tip-${idx}-${landmarks[0].x.toFixed(2)}`;
+      const key = `t${idx}-${landmarks[0].x.toFixed(3)}`;
       const prev = prevPositions.get(key);
       let vx = 0;
       let vy = 0;
@@ -1020,18 +853,9 @@ function processHands(results) {
         vy = lm.y - prev.y;
       }
       prevPositions.set(key, { x: lm.x, y: lm.y });
-      const speed = Math.sqrt(vx * vx + vy * vy);
-      const base = Math.min((0.55 + speed * 120) * strengthMult, 2.4);
-      pushFingerDisplay(lm.x, lm.y);
-      injectPoint(mirrorX(lm.x), lm.y, -vx, vy, base);
+      const speed = Math.hypot(vx, vy);
+      injectPoint(mirrorX(lm.x), lm.y, -vx, vy, (0.18 + speed * 35) * mult);
     }
-
-    const wrist = landmarks[0];
-    pushFingerDisplay(wrist.x, wrist.y);
-    injectPoint(mirrorX(wrist.x), wrist.y, 0, 0, 0.18 * strengthMult);
-    const mid = landmarks[13];
-    pushFingerDisplay(mid.x, mid.y);
-    injectPoint(mirrorX(mid.x), mid.y, 0, 0, 0.12 * strengthMult);
   }
 }
 
@@ -1087,6 +911,7 @@ async function trackHands() {
 function animate() {
   if (!running || !clock) return;
   requestAnimationFrame(animate);
+  if (!renderer || !videoTexture) return;
 
   const dt = Math.min(clock.getDelta(), 0.033);
   const time = clock.getElapsedTime();
@@ -1212,7 +1037,7 @@ async function start(event) {
   frameCount = 0;
   clock.start();
   animate();
-  setStatus("系统就绪 — 移动手指，液态拖尾将持续 1–2 秒");
+  setStatus("就绪 — 手划哪里，哪里出现液态拖尾");
   startBtn.textContent = "已启动";
 }
 
