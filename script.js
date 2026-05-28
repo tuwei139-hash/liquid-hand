@@ -32,6 +32,11 @@ let renderer, scene, camera, quad, videoTexture;
 let hands;
 let handBusy = false;
 let handBusyTimeoutId = null;
+let handsFailStreak = 0;
+let handsCooldownUntil = 0;
+let lastHandsSendAt = 0;
+let handsInputCanvas = null;
+let handsInputCtx = null;
 let frameCount = 0;
 let running = false;
 let starting = false;
@@ -201,6 +206,32 @@ function updateSimResolutionUniforms() {
 
 function mirrorX(x) {
   return 1.0 - x;
+}
+
+function locateMediaPipeFile(file) {
+  const base = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/";
+  if (isMobileDevice() && file.includes("simd")) {
+    return base + file.replace("solution_simd_wasm", "solution_wasm");
+  }
+  return base + file;
+}
+
+function getHandsInput() {
+  if (!isMobileDevice()) return video;
+  if (!handsInputCanvas) {
+    handsInputCanvas = document.createElement("canvas");
+    handsInputCtx = handsInputCanvas.getContext("2d", { willReadFrequently: true });
+  }
+  const vw = video.videoWidth || 480;
+  const vh = video.videoHeight || 360;
+  const targetW = 320;
+  const targetH = Math.max(240, Math.round(targetW * (vh / vw)));
+  if (handsInputCanvas.width !== targetW || handsInputCanvas.height !== targetH) {
+    handsInputCanvas.width = targetW;
+    handsInputCanvas.height = targetH;
+  }
+  handsInputCtx.drawImage(video, 0, 0, targetW, targetH);
+  return handsInputCanvas;
 }
 
 function initShaders() {
@@ -861,8 +892,7 @@ function processHands(results) {
 
 function initMediaPipe() {
   hands = new Hands({
-    locateFile: (file) =>
-      `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+    locateFile: locateMediaPipeFile,
   });
 
   const mobile = isMobileDevice();
@@ -883,22 +913,34 @@ function initMediaPipe() {
 
 async function trackHands() {
   if (!running || !hands || handBusy) return;
+  if (Date.now() < handsCooldownUntil) return;
   if (video.readyState < video.HAVE_CURRENT_DATA || !video.videoWidth) return;
 
   const mobile = isMobileDevice();
   frameCount++;
-  if (mobile && frameCount % 2 !== 0) return;
+  if (mobile) {
+    if (frameCount % 4 !== 0) return;
+    if (Date.now() - lastHandsSendAt < 220) return;
+  }
 
   handBusy = true;
   if (handBusyTimeoutId) clearTimeout(handBusyTimeoutId);
   handBusyTimeoutId = setTimeout(() => {
     handBusy = false;
-  }, 300);
+  }, 500);
 
   try {
-    await hands.send({ image: video });
+    await hands.send({ image: getHandsInput() });
+    handsFailStreak = 0;
+    lastHandsSendAt = Date.now();
   } catch (err) {
-    console.warn("手势识别错误:", err);
+    handsFailStreak++;
+    if (handsFailStreak >= 2) {
+      handsCooldownUntil = Date.now() + 1500;
+    }
+    if (handsFailStreak <= 3) {
+      console.warn("手势识别错误:", err);
+    }
   } finally {
     if (handBusyTimeoutId) {
       clearTimeout(handBusyTimeoutId);
