@@ -19,20 +19,24 @@ const VISUAL = {
   glassBlend: 0.72,
   glowStrength: 0.04,
   fluidHandBoost: 0.04,
+  minHandMask: 0,
+  splatDensityMul: 1,
 };
 
 function getVisual() {
   if (!isMobileDevice()) return VISUAL;
   return {
     handRadiusPx: 300,
-    splatRadius: 0.055,
+    splatRadius: 0.058,
     smoothFactor: 0.42,
-    trailRetain: 0.65,
-    distortScale: 0.04,
-    chromaticAberration: 0.001,
-    glassBlend: 0.9,
-    glowStrength: 0.06,
-    fluidHandBoost: 0.14,
+    trailRetain: 0.68,
+    distortScale: 0.048,
+    chromaticAberration: 0.0012,
+    glassBlend: 0.92,
+    glowStrength: 0.07,
+    fluidHandBoost: 0.18,
+    minHandMask: 0.88,
+    splatDensityMul: 2.2,
   };
 }
 
@@ -49,6 +53,12 @@ function applyVisualUniforms() {
   displayMat.uniforms.uGlow.value = v.glowStrength;
   if (displayMat.uniforms.uFluidHandBoost) {
     displayMat.uniforms.uFluidHandBoost.value = v.fluidHandBoost;
+  }
+  if (displayMat.uniforms.uMinHandMask) {
+    displayMat.uniforms.uMinHandMask.value = v.minHandMask;
+  }
+  if (splatDenMat?.uniforms?.uDensityMul) {
+    splatDenMat.uniforms.uDensityMul.value = v.splatDensityMul;
   }
 }
 
@@ -67,9 +77,9 @@ let handBusyTimeoutId = null;
 let handsFailStreak = 0;
 let handsCooldownUntil = 0;
 let lastHandsSendAt = 0;
-let handsInputCanvas = null;
-let handsInputCtx = null;
 let handsReady = false;
+const handAnchor = new THREE.Vector2(0.5, 0.5);
+let handAnchorStrength = 0;
 let handsWarming = false;
 let frameCount = 0;
 let running = false;
@@ -205,7 +215,11 @@ function blit(material, target, resW, resH) {
 }
 
 function getScreenSize() {
-  return { w: window.innerWidth, h: window.innerHeight };
+  const vv = window.visualViewport;
+  return {
+    w: Math.round(vv?.width ?? window.innerWidth),
+    h: Math.round(vv?.height ?? window.innerHeight),
+  };
 }
 
 function resize() {
@@ -246,21 +260,7 @@ function locateMediaPipeFile(file) {
 }
 
 function getHandsInput() {
-  if (!isMobileDevice()) return video;
-  if (!handsInputCanvas) {
-    handsInputCanvas = document.createElement("canvas");
-    handsInputCtx = handsInputCanvas.getContext("2d", { willReadFrequently: true });
-  }
-  const vw = video.videoWidth || 480;
-  const vh = video.videoHeight || 360;
-  const targetW = 256;
-  const targetH = Math.max(192, Math.round(targetW * (vh / vw)));
-  if (handsInputCanvas.width !== targetW || handsInputCanvas.height !== targetH) {
-    handsInputCanvas.width = targetW;
-    handsInputCanvas.height = targetH;
-  }
-  handsInputCtx.drawImage(video, 0, 0, targetW, targetH);
-  return handsInputCanvas;
+  return video;
 }
 
 function initShaders() {
@@ -313,6 +313,7 @@ function initShaders() {
       uPointCount: { value: 0 },
       uTime: { value: 0 },
       uRadius: { value: VISUAL.splatRadius },
+      uDensityMul: { value: 1 },
       uResolution: { value: new THREE.Vector2(simW, simH) },
     },
     vertexShader: FULLSCREEN_VS,
@@ -323,6 +324,7 @@ function initShaders() {
       uniform int uPointCount;
       uniform float uTime;
       uniform float uRadius;
+      uniform float uDensityMul;
       varying vec2 vUv;
 
       float gauss(float d, float r) {
@@ -340,8 +342,8 @@ function initShaders() {
           float r = uRadius * (0.5 + p.w * 0.18);
           float g = gauss(dist, r);
           float gW = gauss(dist, r * 1.6);
-          dens += g * (0.045 + p.w * 0.03);
-          dens += sin(dist * 70.0 - uTime * 7.0) * gW * 0.022 * p.w;
+          dens += g * (0.045 + p.w * 0.03) * uDensityMul;
+          dens += sin(dist * 70.0 - uTime * 7.0) * gW * 0.022 * p.w * uDensityMul;
         }
         gl_FragColor = vec4(dens, dens, dens, 1.0);
       }
@@ -537,6 +539,9 @@ function initShaders() {
       uGlassBlend: { value: VISUAL.glassBlend },
       uGlow: { value: VISUAL.glowStrength },
       uFluidHandBoost: { value: VISUAL.fluidHandBoost },
+      uHandAnchor: { value: new THREE.Vector2(0.5, 0.5) },
+      uHandStrength: { value: 0 },
+      uMinHandMask: { value: 0 },
     },
     vertexShader: FULLSCREEN_VS,
     fragmentShader: `
@@ -558,6 +563,9 @@ function initShaders() {
       uniform float uGlassBlend;
       uniform float uGlow;
       uniform float uFluidHandBoost;
+      uniform vec2 uHandAnchor;
+      uniform float uHandStrength;
+      uniform float uMinHandMask;
 
       varying vec2 vUv;
 
@@ -577,6 +585,12 @@ function initShaders() {
           float inner = uHandRadius * 0.45;
           float outer = uHandRadius;
           zone = max(zone, 1.0 - smoothstep(inner, outer, d));
+        }
+        if (uHandStrength > 0.02) {
+          vec2 ap = uHandAnchor * uResolution;
+          float d = length(px - ap);
+          float outer = uHandRadius * 1.1;
+          zone = max(zone, (1.0 - smoothstep(uHandRadius * 0.35, outer, d)) * uHandStrength);
         }
         return zone;
       }
@@ -618,7 +632,8 @@ function initShaders() {
         float fluid = sampleFluid(uv);
         float meta = metaballEdge(fluid);
 
-        float effectMask = handZone * smoothstep(0.002, 0.1, fluid + handZone * uFluidHandBoost);
+        float fluidGate = smoothstep(0.002, 0.1, fluid + handZone * uFluidHandBoost);
+        float effectMask = max(handZone * fluidGate, handZone * uMinHandMask);
         effectMask = clamp(effectMask, 0.0, 1.0);
 
         if (effectMask < 0.0003) {
@@ -726,6 +741,9 @@ function initThree() {
   window.addEventListener("resize", resize);
   window.removeEventListener("orientationchange", onOrientationChange);
   window.addEventListener("orientationchange", onOrientationChange);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", resize);
+  }
 }
 
 function onOrientationChange() {
@@ -780,6 +798,23 @@ function updateSplatUniforms(time) {
   splatDenMat.uniforms.uTime.value = time;
 }
 
+function updateHandAnchorFromPoints() {
+  if (pointCount <= 0) {
+    handAnchorStrength *= 0.92;
+    return;
+  }
+  let sx = 0;
+  let sy = 0;
+  let str = 0;
+  for (let i = 0; i < pointCount; i++) {
+    sx += points[i].x;
+    sy += points[i].y;
+    str += points[i].active;
+  }
+  handAnchor.set(sx / pointCount, 1.0 - sy / pointCount);
+  handAnchorStrength = Math.min(str / pointCount + 0.15, 1.0);
+}
+
 function updateDisplayUniforms() {
   const fingers = displayMat.uniforms.uFingers.value;
   let count = 0;
@@ -795,6 +830,9 @@ function updateDisplayUniforms() {
     }
   }
   displayMat.uniforms.uFingerCount.value = count;
+  displayMat.uniforms.uHandAnchor.value.copy(handAnchor);
+  displayMat.uniforms.uHandStrength.value = handAnchorStrength;
+  applyVisualUniforms();
 }
 
 function stepFluid(dt, time) {
@@ -922,6 +960,8 @@ function processHands(results) {
       injectPoint(mirrorX(lm.x), lm.y, -vx, vy, (0.18 + speed * 35) * mult);
     }
   }
+  updateHandAnchorFromPoints();
+  updateDisplayUniforms();
 }
 
 function initMediaPipe() {
@@ -980,8 +1020,8 @@ async function trackHands() {
   const mobile = isMobileDevice();
   frameCount++;
   if (mobile) {
-    if (frameCount % 4 !== 0) return;
-    if (Date.now() - lastHandsSendAt < 280) return;
+    if (frameCount % 3 !== 0) return;
+    if (Date.now() - lastHandsSendAt < 200) return;
   }
 
   handBusy = true;
