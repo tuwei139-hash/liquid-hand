@@ -35,8 +35,8 @@ function getVisual() {
     glassBlend: 0.92,
     glowStrength: 0.07,
     fluidHandBoost: 0.18,
-    minHandMask: 0.55,
-    splatDensityMul: 3.0,
+    minHandMask: 0,
+    splatDensityMul: 3.2,
   };
 }
 
@@ -55,12 +55,7 @@ function applyVisualUniforms() {
     displayMat.uniforms.uFluidHandBoost.value = v.fluidHandBoost;
   }
   if (displayMat.uniforms.uMinHandMask) {
-    const mobile = isMobileDevice();
-    displayMat.uniforms.uMinHandMask.value =
-      handEffectReady || (mobile && handAnchorStrength > 0.08) ? v.minHandMask : 0;
-  }
-  if (displayMat.uniforms.uMobileBoost) {
-    displayMat.uniforms.uMobileBoost.value = isMobileDevice() ? 1.0 : 0.0;
+    displayMat.uniforms.uMinHandMask.value = handEffectReady ? v.minHandMask : 0;
   }
   if (splatDenMat?.uniforms?.uDensityMul) {
     splatDenMat.uniforms.uDensityMul.value = v.splatDensityMul;
@@ -339,7 +334,6 @@ function initShaders() {
     uniforms: {
       uVelocity: { value: null },
       uPoints: { value: Array.from({ length: MAX_POINTS }, () => new THREE.Vector4()) },
-      uPointCount: { value: 0 },
       uTime: { value: 0 },
       uRadius: { value: VISUAL.splatRadius },
       uResolution: { value: new THREE.Vector2(simW, simH) },
@@ -349,7 +343,6 @@ function initShaders() {
       precision highp float;
       uniform sampler2D uVelocity;
       uniform vec4 uPoints[12];
-      uniform int uPointCount;
       uniform float uTime;
       uniform float uRadius;
       varying vec2 vUv;
@@ -361,7 +354,6 @@ function initShaders() {
       void main() {
         vec2 vel = texture2D(uVelocity, vUv).xy;
         for (int i = 0; i < 12; i++) {
-          if (i >= uPointCount) break;
           vec4 p = uPoints[i];
           if (p.w < 0.02) continue;
           vec2 d = vUv - p.xy;
@@ -381,7 +373,6 @@ function initShaders() {
     uniforms: {
       uDensity: { value: null },
       uPoints: { value: Array.from({ length: MAX_POINTS }, () => new THREE.Vector4()) },
-      uPointCount: { value: 0 },
       uTime: { value: 0 },
       uRadius: { value: VISUAL.splatRadius },
       uDensityMul: { value: 1 },
@@ -392,7 +383,6 @@ function initShaders() {
       precision highp float;
       uniform sampler2D uDensity;
       uniform vec4 uPoints[12];
-      uniform int uPointCount;
       uniform float uTime;
       uniform float uRadius;
       uniform float uDensityMul;
@@ -405,7 +395,6 @@ function initShaders() {
       void main() {
         float dens = texture2D(uDensity, vUv).r;
         for (int i = 0; i < 12; i++) {
-          if (i >= uPointCount) break;
           vec4 p = uPoints[i];
           if (p.w < 0.02) continue;
           vec2 d = vUv - p.xy;
@@ -599,8 +588,7 @@ function initShaders() {
       uDensity: { value: null },
       uFlow: { value: null },
       uTrail: { value: null },
-      uFingers: { value: Array.from({ length: MAX_POINTS }, () => new THREE.Vector3()) },
-      uFingerCount: { value: 0 },
+      uFingers: { value: Array.from({ length: MAX_POINTS }, () => new THREE.Vector4()) },
       uTime: { value: 0 },
       uResolution: { value: new THREE.Vector2(1, 1) },
       uSimResolution: { value: new THREE.Vector2(simW, simH) },
@@ -613,7 +601,6 @@ function initShaders() {
       uHandAnchor: { value: new THREE.Vector2(0.5, 0.5) },
       uHandStrength: { value: 0 },
       uMinHandMask: { value: 0 },
-      uMobileBoost: { value: 0 },
       uHandSpread: { value: 0.12 },
     },
     vertexShader: FULLSCREEN_VS,
@@ -625,8 +612,7 @@ function initShaders() {
       uniform sampler2D uDensity;
       uniform sampler2D uFlow;
       uniform sampler2D uTrail;
-      uniform vec3 uFingers[12];
-      uniform float uFingerCount;
+      uniform vec4 uFingers[12];
       uniform float uTime;
       uniform vec2 uResolution;
       uniform vec2 uSimResolution;
@@ -639,7 +625,6 @@ function initShaders() {
       uniform vec2 uHandAnchor;
       uniform float uHandStrength;
       uniform float uMinHandMask;
-      uniform float uMobileBoost;
       uniform float uHandSpread;
 
       varying vec2 vUv;
@@ -660,17 +645,14 @@ function initShaders() {
           zone = max(zone, (1.0 - smoothstep(uHandRadius * 0.2, outer, d)) * uHandStrength);
         }
 
-        if (uMobileBoost < 0.5) {
-          for (int i = 0; i < 12; i++) {
-            if (float(i) >= uFingerCount) continue;
-            vec3 f = uFingers[i];
-            if (f.z < 0.02) continue;
-            vec2 fp = f.xy * uResolution;
-            float d = length(px - fp);
-            float inner = uHandRadius * 0.45;
-            float outer = uHandRadius;
-            zone = max(zone, 1.0 - smoothstep(inner, outer, d));
-          }
+        for (int i = 0; i < 12; i++) {
+          vec4 f = uFingers[i];
+          if (f.w < 0.02) continue;
+          vec2 fp = f.xy * uResolution;
+          float d = length(px - fp);
+          float inner = uHandRadius * 0.45;
+          float outer = uHandRadius;
+          zone = max(zone, 1.0 - smoothstep(inner, outer, d));
         }
         return zone;
       }
@@ -717,9 +699,6 @@ function initShaders() {
 
         float fluidGate = smoothstep(0.002, 0.1, fluid + handZone * uFluidHandBoost);
         float effectMask = max(handZone * fluidGate, handZone * uMinHandMask);
-        if (uMobileBoost > 0.5) {
-          effectMask = max(effectMask, handZone * 0.82);
-        }
         effectMask = clamp(effectMask, 0.0, 1.0);
 
         if (effectMask < 0.0003) {
@@ -868,13 +847,11 @@ function projectVelocity() {
 function updateSplatUniforms(time) {
   const velPts = splatVelMat.uniforms.uPoints.value;
   const denPts = splatDenMat.uniforms.uPoints.value;
-  let count = 0;
-
   for (let i = 0; i < MAX_POINTS; i++) {
     const p = points[i];
     if (!velPts[i]) velPts[i] = new THREE.Vector4();
 
-    const powerScale = isMobileDevice() ? 1.35 : 1.0;
+    const powerScale = isMobileDevice() ? 1.5 : 1.0;
     const power = p.active > 0.03
       ? Math.min((0.25 + p.strength * 0.2 + p.active * 0.35) * powerScale, 1.2)
       : 0;
@@ -884,15 +861,12 @@ function updateSplatUniforms(time) {
       velPts[i].set(p.x, simY, p.vx, -p.vy);
       velPts[i].w = power;
       denPts[i].copy(velPts[i]);
-      count++;
     } else {
       velPts[i].set(0, 0, 0, 0);
       denPts[i].set(0, 0, 0, 0);
     }
   }
 
-  splatVelMat.uniforms.uPointCount.value = count;
-  splatDenMat.uniforms.uPointCount.value = count;
   splatVelMat.uniforms.uTime.value = time;
   splatDenMat.uniforms.uTime.value = time;
 }
@@ -916,19 +890,16 @@ function updateHandAnchorFromPoints() {
 
 function updateDisplayUniforms() {
   const fingers = displayMat.uniforms.uFingers.value;
-  let count = 0;
 
   for (let i = 0; i < MAX_POINTS; i++) {
-    if (!fingers[i]) fingers[i] = new THREE.Vector3();
+    if (!fingers[i]) fingers[i] = new THREE.Vector4();
     const p = points[i];
     if (p.active > 0.03) {
-      fingers[i].set(p.x, 1.0 - p.y, p.active);
-      count++;
+      fingers[i].set(p.x, 1.0 - p.y, 0, p.active);
     } else {
-      fingers[i].set(0, 0, 0);
+      fingers[i].set(0, 0, 0, 0);
     }
   }
-  displayMat.uniforms.uFingerCount.value = count;
   displayMat.uniforms.uHandAnchor.value.copy(handAnchor);
   displayMat.uniforms.uHandStrength.value = handAnchorStrength;
   applyVisualUniforms();
@@ -1044,7 +1015,7 @@ function processHands(results) {
   }
 
   handDetectStreak++;
-  handEffectReady = handDetectStreak >= (mobile ? 2 : 1);
+  handEffectReady = handDetectStreak >= 1;
   updateHandSpreadFromLandmarks(landmarks);
   setStatus(`已识别 ${results.multiHandLandmarks.length} 只手 · 移动手指划过液态玻璃`);
 
