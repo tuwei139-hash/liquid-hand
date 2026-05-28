@@ -1,4 +1,4 @@
-/* global THREE, Hands, Camera */
+/* global THREE, Hands */
 
 const TIP_INDICES = [4, 8, 12, 16, 20];
 const PALM_INDEX = 9;
@@ -16,7 +16,9 @@ const hud = document.getElementById("hud");
 const startBtn = document.getElementById("startBtn");
 
 let renderer, scene, camera, quad, videoTexture;
-let hands, mpCamera;
+let hands;
+let handBusy = false;
+let frameCount = 0;
 let running = false;
 let clock = new THREE.Clock();
 let simW = 256;
@@ -679,24 +681,38 @@ function initThree() {
   initDivergenceRT();
 
   resize();
-  window.addEventListener("resize", onResize);
-  window.addEventListener("orientationchange", () => setTimeout(onResize, 200));
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", () => setTimeout(resize, 200));
 }
 
-function onResize() {
+function resize() {
+  if (!renderer) return;
+
   const w = window.innerWidth;
   const h = window.innerHeight;
+
   renderer.setSize(w, h, false);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
-  displayRT.setSize(w, h);
-  bloomRT.setSize(w, h);
-  prevFrameRT.setSize(w, h);
-  finalRT.setSize(w, h);
+  if (displayRT) {
+    displayRT.setSize(w, h);
+    bloomRT.setSize(w, h);
+    prevFrameRT.setSize(w, h);
+    finalRT.setSize(w, h);
+  }
 
-  displayMat.uniforms.uResolution.value.set(w, h);
-  bloomMat.uniforms.uResolution.value.set(w, h);
-  blurMat.uniforms.uResolution.value.set(w, h);
-  motionBlurMat.uniforms.uResolution.value.set(w, h);
+  if (displayMat?.uniforms?.uResolution) {
+    displayMat.uniforms.uResolution.value.set(w, h);
+  }
+  if (bloomMat?.uniforms?.uResolution) {
+    bloomMat.uniforms.uResolution.value.set(w, h);
+  }
+  if (blurMat?.uniforms?.uResolution) {
+    blurMat.uniforms.uResolution.value.set(w, h);
+  }
+  if (motionBlurMat?.uniforms?.uResolution) {
+    motionBlurMat.uniforms.uResolution.value.set(w, h);
+  }
 }
 
 let divergenceRT;
@@ -920,14 +936,29 @@ function initMediaPipe() {
   });
 
   hands.onResults(processHands);
+}
 
-  mpCamera = new Camera(video, {
-    onFrame: async () => {
-      if (running) await hands.send({ image: video });
-    },
-    width: 1280,
-    height: 720,
-  });
+async function trackHands() {
+  if (!running || !hands || handBusy) return;
+  if (video.readyState < video.HAVE_CURRENT_DATA || !video.videoWidth) return;
+
+  const mobile = isMobileDevice();
+  frameCount++;
+  if (mobile && frameCount % 3 !== 0) return;
+
+  handBusy = true;
+  const watchdog = setTimeout(() => {
+    handBusy = false;
+  }, 300);
+
+  try {
+    await hands.send({ image: video });
+  } catch (err) {
+    console.warn("手势识别错误:", err);
+  } finally {
+    clearTimeout(watchdog);
+    handBusy = false;
+  }
 }
 
 function animate() {
@@ -942,31 +973,67 @@ function animate() {
   }
 
   renderFrame(dt, time);
+  trackHands();
 }
 
-async function start() {
+function isMobileDevice() {
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+function setupVideoElement() {
+  video.muted = true;
+  video.defaultMuted = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.setAttribute("muted", "");
+  video.setAttribute("playsinline", "");
+  video.setAttribute("webkit-playsinline", "");
+}
+
+async function start(event) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
   startBtn.disabled = true;
+  setupVideoElement();
   setStatus("正在请求摄像头权限...");
+
+  const mobile = isMobileDevice();
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "user",
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
       audio: false,
+      video: {
+        facingMode: { ideal: "user" },
+        width: { ideal: mobile ? 480 : 1280, max: mobile ? 480 : 1280 },
+        height: { ideal: mobile ? 360 : 720, max: mobile ? 360 : 720 },
+      },
     });
     video.srcObject = stream;
+    video.muted = true;
     await video.play();
   } catch (err) {
-    setStatus("摄像头访问失败: " + err.message);
+    console.error("摄像头错误:", err);
+    setStatus("摄像头访问失败: " + (err.message || err.name));
     startBtn.disabled = false;
     return;
   }
 
-  initThree();
-  initMediaPipe();
+  try {
+    initThree();
+    initMediaPipe();
+  } catch (err) {
+    console.error("初始化失败:", err);
+    setStatus("初始化失败: " + (err.message || err));
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
+    }
+    startBtn.disabled = false;
+    return;
+  }
 
   overlay.classList.add("hidden");
   hud.classList.remove("hidden");
@@ -974,12 +1041,14 @@ async function start() {
   running = true;
   clock.start();
   animate();
-
-  await mpCamera.start();
   setStatus("系统就绪 — 移动手指，液态拖尾将持续 1–2 秒");
 }
 
 startBtn.addEventListener("click", start);
+startBtn.addEventListener("touchend", (e) => {
+  e.preventDefault();
+  start(e);
+}, { passive: false });
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) clock.stop();
