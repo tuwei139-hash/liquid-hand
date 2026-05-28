@@ -35,8 +35,8 @@ function getVisual() {
     glassBlend: 0.92,
     glowStrength: 0.07,
     fluidHandBoost: 0.18,
-    minHandMask: 0.38,
-    splatDensityMul: 2.4,
+    minHandMask: 0.55,
+    splatDensityMul: 3.0,
   };
 }
 
@@ -56,9 +56,11 @@ function applyVisualUniforms() {
   }
   if (displayMat.uniforms.uMinHandMask) {
     const mobile = isMobileDevice();
-    const readyMask = handEffectReady ? v.minHandMask : 0;
-    const liveMask = mobile && pointCount > 0 ? v.minHandMask * 0.55 : 0;
-    displayMat.uniforms.uMinHandMask.value = Math.max(readyMask, liveMask);
+    displayMat.uniforms.uMinHandMask.value =
+      handEffectReady || (mobile && handAnchorStrength > 0.08) ? v.minHandMask : 0;
+  }
+  if (displayMat.uniforms.uMobileBoost) {
+    displayMat.uniforms.uMobileBoost.value = isMobileDevice() ? 1.0 : 0.0;
   }
   if (splatDenMat?.uniforms?.uDensityMul) {
     splatDenMat.uniforms.uDensityMul.value = v.splatDensityMul;
@@ -85,6 +87,7 @@ const handAnchor = new THREE.Vector2(0.5, 0.5);
 let handAnchorStrength = 0;
 let handDetectStreak = 0;
 let handEffectReady = false;
+let handSpreadNorm = 0.12;
 let handsWarming = false;
 let frameCount = 0;
 let running = false;
@@ -164,18 +167,29 @@ function getRenderTargetType(rendererInstance) {
   if (!rendererInstance.capabilities.isWebGL2) {
     return THREE.UnsignedByteType;
   }
-  if (isMobileDevice()) {
-    return THREE.HalfFloatType;
-  }
   try {
     const gl = rendererInstance.getContext();
-    if (gl.getExtension("EXT_color_buffer_float") || gl.getExtension("OES_texture_half_float")) {
+    if (
+      gl.getExtension("EXT_color_buffer_float")
+      || gl.getExtension("EXT_color_buffer_half_float")
+      || gl.getExtension("OES_texture_half_float")
+    ) {
       return THREE.HalfFloatType;
     }
   } catch (e) {
     /* byte fallback */
   }
   return THREE.UnsignedByteType;
+}
+
+function isFluidFramebufferOk() {
+  if (!renderer || !velocityPP) return false;
+  const gl = renderer.getContext();
+  const prev = renderer.getRenderTarget();
+  renderer.setRenderTarget(velocityPP.read);
+  const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+  renderer.setRenderTarget(prev);
+  return ok;
 }
 
 class PingPong {
@@ -238,7 +252,6 @@ function resize() {
   if (displayMat) {
     displayMat.uniforms.uResolution.value.set(w, h);
   }
-  updateVideoCoverUniforms();
   applyVisualUniforms();
   updateSimResolutionUniforms();
 }
@@ -262,47 +275,22 @@ function mirrorX(x) {
   return 1.0 - x;
 }
 
-/** object-fit:cover — 与 style.css 中 video 及 display 着色器一致 */
-function getVideoCoverTransform() {
-  const vw = video.videoWidth || 1;
-  const vh = video.videoHeight || 1;
-  const { w, h } = getScreenSize();
-  const videoAspect = vw / vh;
-  const screenAspect = w / h;
-  let scaleX = 1;
-  let scaleY = 1;
-  if (screenAspect > videoAspect) {
-    scaleY = videoAspect / screenAspect;
-  } else {
-    scaleX = screenAspect / videoAspect;
-  }
-  return {
-    scaleX,
-    scaleY,
-    offsetX: (1 - scaleX) * 0.5,
-    offsetY: (1 - scaleY) * 0.5,
-  };
-}
-
-function updateVideoCoverUniforms() {
-  if (!displayMat?.uniforms?.uVideoScale) return;
-  const t = getVideoCoverTransform();
-  displayMat.uniforms.uVideoScale.value.set(t.scaleX, t.scaleY);
-  displayMat.uniforms.uVideoOffset.value.set(t.offsetX, t.offsetY);
-}
-
+/** 与全屏拉伸画布一致：仅镜像，不做 cover（避免边缘 UV 越界断层） */
 function mapLandmark(lmX, lmY, vx = 0, vy = 0) {
-  const t = getVideoCoverTransform();
-  const sx = lmX * t.scaleX + t.offsetX;
-  const sy = lmY * t.scaleY + t.offsetY;
-  const dSx = vx * t.scaleX;
-  const dSy = vy * t.scaleY;
   return {
-    x: mirrorX(sx),
-    y: sy,
-    vx: -dSx,
-    vy: dSy,
+    x: mirrorX(lmX),
+    y: lmY,
+    vx: -vx,
+    vy,
   };
+}
+
+function updateHandSpreadFromLandmarks(landmarks) {
+  const spread = Math.hypot(
+    landmarks[8].x - landmarks[4].x,
+    landmarks[8].y - landmarks[4].y
+  );
+  handSpreadNorm = Math.min(Math.max(spread, 0.06), 0.35);
 }
 
 function isPlausibleHand(landmarks) {
@@ -625,8 +613,8 @@ function initShaders() {
       uHandAnchor: { value: new THREE.Vector2(0.5, 0.5) },
       uHandStrength: { value: 0 },
       uMinHandMask: { value: 0 },
-      uVideoScale: { value: new THREE.Vector2(1, 1) },
-      uVideoOffset: { value: new THREE.Vector2(0, 0) },
+      uMobileBoost: { value: 0 },
+      uHandSpread: { value: 0.12 },
     },
     vertexShader: FULLSCREEN_VS,
     fragmentShader: `
@@ -651,34 +639,38 @@ function initShaders() {
       uniform vec2 uHandAnchor;
       uniform float uHandStrength;
       uniform float uMinHandMask;
-      uniform vec2 uVideoScale;
-      uniform vec2 uVideoOffset;
+      uniform float uMobileBoost;
+      uniform float uHandSpread;
 
       varying vec2 vUv;
 
       vec2 videoUv(vec2 screenUv) {
-        vec2 uv = (screenUv - uVideoOffset) / uVideoScale;
-        return vec2(1.0 - uv.x, uv.y);
+        return vec2(1.0 - screenUv.x, screenUv.y);
       }
 
       float handProximity(vec2 uv) {
         vec2 px = uv * uResolution;
         float zone = 0.0;
-        for (int i = 0; i < 12; i++) {
-          if (float(i) >= uFingerCount) continue;
-          vec3 f = uFingers[i];
-          if (f.z < 0.02) continue;
-          vec2 fp = f.xy * uResolution;
-          float d = length(px - fp);
-          float inner = uHandRadius * 0.45;
-          float outer = uHandRadius;
-          zone = max(zone, 1.0 - smoothstep(inner, outer, d));
-        }
+
         if (uHandStrength > 0.02) {
           vec2 ap = uHandAnchor * uResolution;
           float d = length(px - ap);
-          float outer = uHandRadius * 1.1;
-          zone = max(zone, (1.0 - smoothstep(uHandRadius * 0.35, outer, d)) * uHandStrength);
+          float spreadMul = 0.75 + uHandSpread * 2.2;
+          float outer = uHandRadius * spreadMul;
+          zone = max(zone, (1.0 - smoothstep(uHandRadius * 0.2, outer, d)) * uHandStrength);
+        }
+
+        if (uMobileBoost < 0.5) {
+          for (int i = 0; i < 12; i++) {
+            if (float(i) >= uFingerCount) continue;
+            vec3 f = uFingers[i];
+            if (f.z < 0.02) continue;
+            vec2 fp = f.xy * uResolution;
+            float d = length(px - fp);
+            float inner = uHandRadius * 0.45;
+            float outer = uHandRadius;
+            zone = max(zone, 1.0 - smoothstep(inner, outer, d));
+          }
         }
         return zone;
       }
@@ -705,11 +697,14 @@ function initShaders() {
       }
 
       vec3 sampleVideo(vec2 uv, vec2 off, float ca) {
-        vec2 base = videoUv(uv);
-        float r = texture2D(uVideo, videoUv(uv + off + vec2(ca, 0.0))).r;
-        float g = texture2D(uVideo, videoUv(uv + off)).g;
-        float b = texture2D(uVideo, videoUv(uv + off - vec2(ca, 0.0))).b;
-        return vec3(r, g, b);
+        vec2 vuR = clamp(videoUv(uv + off + vec2(ca, 0.0)), 0.001, 0.999);
+        vec2 vuG = clamp(videoUv(uv + off), 0.001, 0.999);
+        vec2 vuB = clamp(videoUv(uv + off - vec2(ca, 0.0)), 0.001, 0.999);
+        return vec3(
+          texture2D(uVideo, vuR).r,
+          texture2D(uVideo, vuG).g,
+          texture2D(uVideo, vuB).b
+        );
       }
 
       void main() {
@@ -722,6 +717,9 @@ function initShaders() {
 
         float fluidGate = smoothstep(0.002, 0.1, fluid + handZone * uFluidHandBoost);
         float effectMask = max(handZone * fluidGate, handZone * uMinHandMask);
+        if (uMobileBoost > 0.5) {
+          effectMask = max(effectMask, handZone * 0.82);
+        }
         effectMask = clamp(effectMask, 0.0, 1.0);
 
         if (effectMask < 0.0003) {
@@ -819,6 +817,19 @@ function initThree() {
   scene.add(quad);
 
   initFluid();
+  if (!isFluidFramebufferOk()) {
+    const byteType = THREE.UnsignedByteType;
+    velocityPP = new PingPong(simW, simH, { type: byteType });
+    densityPP = new PingPong(simW, simH, { type: byteType });
+    flowPP = new PingPong(simW, simH, { type: byteType });
+    trailPP = new PingPong(simW, simH, { type: byteType });
+    pressurePP = new PingPong(simW, simH, { type: byteType });
+    velocityPP.clear(renderer);
+    densityPP.clear(renderer);
+    flowPP.clear(renderer);
+    trailPP.clear(renderer);
+    pressurePP.clear(renderer);
+  }
   initShaders();
   initDivergenceRT();
   updateSimResolutionUniforms();
@@ -973,7 +984,9 @@ function renderFrame(dt, time) {
   displayMat.uniforms.uFlow.value = flowPP.read.texture;
   displayMat.uniforms.uTrail.value = trailPP.read.texture;
   displayMat.uniforms.uTime.value = time;
-  updateVideoCoverUniforms();
+  if (displayMat.uniforms.uHandSpread) {
+    displayMat.uniforms.uHandSpread.value = handSpreadNorm;
+  }
 
   const prev = renderer.getRenderTarget();
   renderer.setRenderTarget(null);
@@ -1003,9 +1016,13 @@ function injectPoint(mx, y, vx, vy, strength) {
 }
 
 function processHands(results) {
+  const mobile = isMobileDevice();
+  const mult = mobile ? 2.0 : 1.0;
+  const activeDecay = mobile ? 0.996 : 0.99;
+
   pointCount = 0;
   for (let i = 0; i < MAX_POINTS; i++) {
-    points[i].active *= 0.99;
+    points[i].active *= activeDecay;
     points[i].vx *= 0.88;
     points[i].vy *= 0.88;
   }
@@ -1017,8 +1034,6 @@ function processHands(results) {
     return;
   }
 
-  const mobile = isMobileDevice();
-  const mult = mobile ? 1.45 : 1.0;
   const landmarks = results.multiHandLandmarks[0];
 
   if (!isPlausibleHand(landmarks)) {
@@ -1030,6 +1045,7 @@ function processHands(results) {
 
   handDetectStreak++;
   handEffectReady = handDetectStreak >= (mobile ? 2 : 1);
+  updateHandSpreadFromLandmarks(landmarks);
   setStatus(`已识别 ${results.multiHandLandmarks.length} 只手 · 移动手指划过液态玻璃`);
 
   const palm = landmarks[PALM_INDEX];
@@ -1044,7 +1060,8 @@ function processHands(results) {
   prevPositions.set(palmKey, { x: palm.x, y: palm.y });
   const palmSpeed = Math.hypot(pvx, pvy);
   const palmPt = mapLandmark(palm.x, palm.y, pvx, pvy);
-  injectPoint(palmPt.x, palmPt.y, palmPt.vx, palmPt.vy, (0.2 + palmSpeed * 25) * mult);
+  const palmStr = Math.max((0.2 + palmSpeed * 25) * mult, mobile ? 0.42 : 0);
+  injectPoint(palmPt.x, palmPt.y, palmPt.vx, palmPt.vy, palmStr);
 
   for (const idx of TIP_INDICES) {
     if (pointCount >= MAX_POINTS) break;
@@ -1060,7 +1077,8 @@ function processHands(results) {
     prevPositions.set(key, { x: lm.x, y: lm.y });
     const speed = Math.hypot(vx, vy);
     const tipPt = mapLandmark(lm.x, lm.y, vx, vy);
-    injectPoint(tipPt.x, tipPt.y, tipPt.vx, tipPt.vy, (0.18 + speed * 35) * mult);
+    const tipStr = Math.max((0.18 + speed * 35) * mult, mobile ? 0.32 : 0);
+    injectPoint(tipPt.x, tipPt.y, tipPt.vx, tipPt.vy, tipStr);
   }
   updateHandAnchorFromPoints();
   updateDisplayUniforms();
@@ -1122,8 +1140,7 @@ async function trackHands() {
   const mobile = isMobileDevice();
   frameCount++;
   if (mobile) {
-    if (frameCount % 2 !== 0) return;
-    if (Date.now() - lastHandsSendAt < 120) return;
+    if (Date.now() - lastHandsSendAt < 90) return;
   }
 
   handBusy = true;
