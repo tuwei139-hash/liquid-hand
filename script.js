@@ -69,6 +69,8 @@ let handsCooldownUntil = 0;
 let lastHandsSendAt = 0;
 let handsInputCanvas = null;
 let handsInputCtx = null;
+let handsReady = false;
+let handsWarming = false;
 let frameCount = 0;
 let running = false;
 let starting = false;
@@ -237,12 +239,10 @@ function mirrorX(x) {
   return 1.0 - x;
 }
 
+const MEDIAPIPE_CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240";
+
 function locateMediaPipeFile(file) {
-  const base = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/";
-  if (isMobileDevice() && file.includes("simd")) {
-    return base + file.replace("solution_simd_wasm", "solution_wasm");
-  }
-  return base + file;
+  return `${MEDIAPIPE_CDN}/${file}`;
 }
 
 function getHandsInput() {
@@ -253,8 +253,8 @@ function getHandsInput() {
   }
   const vw = video.videoWidth || 480;
   const vh = video.videoHeight || 360;
-  const targetW = 320;
-  const targetH = Math.max(240, Math.round(targetW * (vh / vw)));
+  const targetW = 256;
+  const targetH = Math.max(192, Math.round(targetW * (vh / vw)));
   if (handsInputCanvas.width !== targetW || handsInputCanvas.height !== targetH) {
     handsInputCanvas.width = targetW;
     handsInputCanvas.height = targetH;
@@ -943,6 +943,28 @@ function initMediaPipe() {
   });
 
   hands.onResults(processHands);
+  handsReady = false;
+  handsWarming = false;
+}
+
+async function warmupHands() {
+  if (!hands || handsReady || handsWarming) return;
+  if (video.readyState < video.HAVE_CURRENT_DATA || !video.videoWidth) return;
+
+  handsWarming = true;
+  try {
+    await hands.send({ image: getHandsInput() });
+    handsReady = true;
+    handsFailStreak = 0;
+    lastHandsSendAt = Date.now();
+  } catch (err) {
+    handsCooldownUntil = Date.now() + 2000;
+    if (handsFailStreak <= 2) {
+      console.warn("手势模型初始化:", err);
+    }
+  } finally {
+    handsWarming = false;
+  }
 }
 
 async function trackHands() {
@@ -950,11 +972,16 @@ async function trackHands() {
   if (Date.now() < handsCooldownUntil) return;
   if (video.readyState < video.HAVE_CURRENT_DATA || !video.videoWidth) return;
 
+  if (!handsReady) {
+    if (!handsWarming) warmupHands();
+    return;
+  }
+
   const mobile = isMobileDevice();
   frameCount++;
   if (mobile) {
-    if (frameCount % 3 !== 0) return;
-    if (Date.now() - lastHandsSendAt < 160) return;
+    if (frameCount % 4 !== 0) return;
+    if (Date.now() - lastHandsSendAt < 280) return;
   }
 
   handBusy = true;
@@ -1111,8 +1138,10 @@ async function start(event) {
   running = true;
   starting = false;
   frameCount = 0;
+  handsReady = false;
   clock.start();
   animate();
+  setTimeout(() => warmupHands(), 600);
   setStatus("就绪 — 手划哪里，哪里出现液态拖尾");
   startBtn.textContent = "已启动";
 }
