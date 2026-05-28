@@ -14,13 +14,17 @@ const statusEl = document.getElementById("status");
 const overlay = document.getElementById("overlay");
 const hud = document.getElementById("hud");
 const startBtn = document.getElementById("startBtn");
+const envWarning = document.getElementById("envWarning");
 
 let renderer, scene, camera, quad, videoTexture;
 let hands;
 let handBusy = false;
+let handBusyTimeoutId = null;
 let frameCount = 0;
 let running = false;
-let clock = new THREE.Clock();
+let starting = false;
+let clock = null;
+let rtType = null;
 let simW = 256;
 let simH = 256;
 
@@ -37,10 +41,65 @@ let pressureMat, divMat, gradSubtractMat, displayMat, bloomMat, blurMat;
 let compositeMat, motionBlurMat, copyMat;
 let finalRT;
 
-const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+let orthoCam = null;
 
 function setStatus(text) {
-  statusEl.textContent = text;
+  if (statusEl) statusEl.textContent = text;
+}
+
+function showEnvWarning(message) {
+  if (!envWarning) return;
+  if (message) {
+    envWarning.textContent = message;
+    envWarning.hidden = false;
+  } else {
+    envWarning.hidden = true;
+    envWarning.textContent = "";
+  }
+}
+
+function showFatal(message) {
+  console.error(message);
+  showEnvWarning(message);
+  setStatus(message);
+  if (startBtn) {
+    startBtn.disabled = false;
+    startBtn.textContent = "开启摄像头体验";
+  }
+  starting = false;
+}
+
+function isMobileDevice() {
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+function checkLibraries() {
+  if (typeof THREE === "undefined") {
+    showFatal(
+      "Three.js 未加载。请检查网络，或在 Edge 中：设置 → 隐私 → 关闭对本站的跟踪防护后刷新。"
+    );
+    return false;
+  }
+  if (typeof Hands === "undefined") {
+    showFatal("MediaPipe Hands 未加载。请检查网络后刷新页面。");
+    return false;
+  }
+  return true;
+}
+
+function getRenderTargetType(rendererInstance) {
+  if (!rendererInstance.capabilities.isWebGL2) {
+    return THREE.UnsignedByteType;
+  }
+  try {
+    const gl = rendererInstance.getContext();
+    if (gl.getExtension("EXT_color_buffer_float") || gl.getExtension("OES_texture_half_float")) {
+      return THREE.HalfFloatType;
+    }
+  } catch (e) {
+    /* use byte fallback */
+  }
+  return THREE.UnsignedByteType;
 }
 
 class PingPong {
@@ -76,7 +135,10 @@ class PingPong {
 }
 
 function blit(material, target) {
-  material.uniforms.uResolution.value.set(simW, simH);
+  if (!renderer || !quad || !orthoCam) return;
+  if (material.uniforms?.uResolution) {
+    material.uniforms.uResolution.value.set(simW, simH);
+  }
   const prev = renderer.getRenderTarget();
   renderer.setRenderTarget(target);
   quad.material = material;
@@ -607,15 +669,13 @@ function initShaders() {
 }
 
 function initFluid() {
-  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  const base = isMobile ? 192 : 320;
-  const aspect = window.innerWidth / window.innerHeight;
+  const mobile = isMobileDevice();
+  const base = mobile ? 192 : 320;
+  const aspect = window.innerWidth / Math.max(window.innerHeight, 1);
   simH = base;
   simW = Math.round(base * Math.min(Math.max(aspect, 0.6), 1.8));
 
-  const rtType = renderer.capabilities.isWebGL2
-    ? THREE.HalfFloatType
-    : THREE.UnsignedByteType;
+  rtType = getRenderTargetType(renderer);
 
   velocityPP = new PingPong(simW, simH, { type: rtType });
   densityPP = new PingPong(simW, simH, { type: rtType });
@@ -653,6 +713,11 @@ function initFluid() {
 }
 
 function initThree() {
+  if (!clock) clock = new THREE.Clock();
+  if (!orthoCam) {
+    orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  }
+
   renderer = new THREE.WebGLRenderer({
     canvas,
     antialias: false,
@@ -681,8 +746,14 @@ function initThree() {
   initDivergenceRT();
 
   resize();
+  window.removeEventListener("resize", resize);
   window.addEventListener("resize", resize);
-  window.addEventListener("orientationchange", () => setTimeout(resize, 200));
+  window.removeEventListener("orientationchange", onOrientationChange);
+  window.addEventListener("orientationchange", onOrientationChange);
+}
+
+function onOrientationChange() {
+  setTimeout(resize, 200);
 }
 
 function resize() {
@@ -721,7 +792,7 @@ function initDivergenceRT() {
   divergenceRT = new THREE.WebGLRenderTarget(simW, simH, {
     minFilter: THREE.LinearFilter,
     magFilter: THREE.LinearFilter,
-    type: THREE.HalfFloatType,
+    type: rtType || THREE.UnsignedByteType,
   });
 }
 
@@ -927,10 +998,15 @@ function initMediaPipe() {
       `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
   });
 
-  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  hands.setOptions({
+  const mobile = isMobileDevice();
+  hands.setOptions(mobile ? {
+    maxNumHands: 1,
+    modelComplexity: 0,
+    minDetectionConfidence: 0.35,
+    minTrackingConfidence: 0.35,
+  } : {
     maxNumHands: 2,
-    modelComplexity: isMobile ? 0 : 1,
+    modelComplexity: 1,
     minDetectionConfidence: 0.55,
     minTrackingConfidence: 0.45,
   });
@@ -947,7 +1023,8 @@ async function trackHands() {
   if (mobile && frameCount % 3 !== 0) return;
 
   handBusy = true;
-  const watchdog = setTimeout(() => {
+  if (handBusyTimeoutId) clearTimeout(handBusyTimeoutId);
+  handBusyTimeoutId = setTimeout(() => {
     handBusy = false;
   }, 300);
 
@@ -956,13 +1033,16 @@ async function trackHands() {
   } catch (err) {
     console.warn("手势识别错误:", err);
   } finally {
-    clearTimeout(watchdog);
+    if (handBusyTimeoutId) {
+      clearTimeout(handBusyTimeoutId);
+      handBusyTimeoutId = null;
+    }
     handBusy = false;
   }
 }
 
 function animate() {
-  if (!running) return;
+  if (!running || !clock) return;
   requestAnimationFrame(animate);
 
   const dt = Math.min(clock.getDelta(), 0.033);
@@ -976,8 +1056,37 @@ function animate() {
   trackHands();
 }
 
-function isMobileDevice() {
-  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+async function attachCameraStream() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("当前浏览器不支持摄像头 API");
+  }
+
+  const mobile = isMobileDevice();
+  const attempts = [
+    {
+      audio: false,
+      video: {
+        facingMode: { ideal: "user" },
+        width: { ideal: mobile ? 480 : 1280, max: mobile ? 640 : 1920 },
+        height: { ideal: mobile ? 360 : 720, max: mobile ? 480 : 1080 },
+      },
+    },
+    { audio: false, video: { facingMode: "user" } },
+    { audio: false, video: true },
+  ];
+
+  let lastError;
+  for (const constraints of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      lastError = err;
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        throw err;
+      }
+    }
+  }
+  throw lastError;
 }
 
 function setupVideoElement() {
@@ -990,48 +1099,65 @@ function setupVideoElement() {
   video.setAttribute("webkit-playsinline", "");
 }
 
+function showCameraFallback() {
+  overlay.classList.add("hidden");
+  hud.classList.remove("hidden");
+  video.classList.add("camera-fallback");
+  setStatus("摄像头已开启（简化模式）。特效模块加载失败，请刷新或换 Chrome 重试。");
+}
+
+function getCameraErrorMessage(err) {
+  const name = err?.name || "";
+  if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+    return "摄像头权限被拒绝，请在浏览器设置中允许摄像头后刷新。";
+  }
+  if (name === "NotFoundError") {
+    return "未找到摄像头设备。";
+  }
+  if (name === "NotReadableError" || name === "TrackStartError") {
+    return "摄像头被占用，请关闭其他使用摄像头的应用。";
+  }
+  if (name === "SecurityError") {
+    return "安全限制：请使用 HTTPS 访问（Vercel 域名即可）。";
+  }
+  return err?.message || name || "未知错误";
+}
+
 async function start(event) {
   if (event) {
     event.preventDefault();
     event.stopPropagation();
   }
+  if (starting || running) return;
+  if (!checkLibraries()) return;
 
+  starting = true;
   startBtn.disabled = true;
+  startBtn.textContent = "正在启动…";
   setupVideoElement();
-  setStatus("正在请求摄像头权限...");
-
-  const mobile = isMobileDevice();
+  setStatus("正在请求摄像头权限…");
 
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: { ideal: "user" },
-        width: { ideal: mobile ? 480 : 1280, max: mobile ? 480 : 1280 },
-        height: { ideal: mobile ? 360 : 720, max: mobile ? 360 : 720 },
-      },
-    });
+    const stream = await attachCameraStream();
     video.srcObject = stream;
     video.muted = true;
     await video.play();
   } catch (err) {
     console.error("摄像头错误:", err);
-    setStatus("摄像头访问失败: " + (err.message || err.name));
-    startBtn.disabled = false;
+    showFatal("摄像头访问失败: " + getCameraErrorMessage(err));
     return;
   }
+
+  setStatus("正在初始化渲染…");
 
   try {
     initThree();
     initMediaPipe();
   } catch (err) {
     console.error("初始化失败:", err);
-    setStatus("初始化失败: " + (err.message || err));
-    if (video.srcObject) {
-      video.srcObject.getTracks().forEach((t) => t.stop());
-      video.srcObject = null;
-    }
-    startBtn.disabled = false;
+    starting = false;
+    showCameraFallback();
+    startBtn.textContent = "已开启摄像头";
     return;
   }
 
@@ -1039,18 +1165,51 @@ async function start(event) {
   hud.classList.remove("hidden");
 
   running = true;
+  starting = false;
+  frameCount = 0;
   clock.start();
   animate();
   setStatus("系统就绪 — 移动手指，液态拖尾将持续 1–2 秒");
+  startBtn.textContent = "已启动";
 }
 
-startBtn.addEventListener("click", start);
-startBtn.addEventListener("touchend", (e) => {
-  e.preventDefault();
-  start(e);
-}, { passive: false });
+function bindStartButton() {
+  if (!startBtn) return;
+
+  let lastTap = 0;
+  const handleStart = (e) => {
+    const now = Date.now();
+    if (now - lastTap < 600) return;
+    lastTap = now;
+    start(e);
+  };
+
+  startBtn.addEventListener("click", handleStart);
+  startBtn.addEventListener(
+    "touchend",
+    (e) => {
+      e.preventDefault();
+      handleStart(e);
+    },
+    { passive: false }
+  );
+}
+
+function bootstrap() {
+  if (!video || !canvas || !startBtn) {
+    showFatal("页面元素加载失败，请刷新页面。");
+    return;
+  }
+  if (!checkLibraries()) return;
+  showEnvWarning("");
+  bindStartButton();
+  setStatus("点击按钮开启摄像头");
+}
 
 document.addEventListener("visibilitychange", () => {
+  if (!clock) return;
   if (document.hidden) clock.stop();
   else if (running) clock.start();
 });
+
+window.LiquidHand = { bootstrap };

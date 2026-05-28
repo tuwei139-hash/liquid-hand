@@ -20,21 +20,106 @@
 
   <div id="hud">
     <div class="logo">LIQUID<span>HAND</span></div>
-    <div id="status">正在初始化...</div>
-    <div class="hint">缓慢移动手指 — 液态拖尾将持续 1–2 秒</div>
+    <div id="status">正在加载依赖…</div>
+    <div class="hint">镜像自拍 · 手划哪里 · 哪里出现液态玻璃</div>
   </div>
 
   <div id="overlay">
     <div class="overlay-glow"></div>
     <h1>LIQUID HAND</h1>
     <p>流体模拟 · 液态玻璃 · 持续拖尾 · 水波纹</p>
-    <button id="startBtn" type="button">开启摄像头体验</button>
+    <p id="envWarning" class="env-warning" hidden></p>
+    <button id="startBtn" type="button" disabled>正在加载…</button>
     <p class="privacy">画面仅在本地处理，不会上传</p>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
-  <script src="script.js"></script>
+  <script>
+    (function loadDeps() {
+      const statusEl = document.getElementById("status");
+      const warnEl = document.getElementById("envWarning");
+      const startBtn = document.getElementById("startBtn");
+
+      function setLoadStatus(msg) {
+        if (statusEl) statusEl.textContent = msg;
+      }
+
+      function showLoadError(msg) {
+        console.error(msg);
+        if (warnEl) {
+          warnEl.hidden = false;
+          warnEl.textContent = msg;
+        }
+        setLoadStatus("加载失败，请刷新页面");
+        if (startBtn) {
+          startBtn.disabled = true;
+          startBtn.textContent = "加载失败";
+        }
+      }
+
+      function loadScript(url) {
+        return new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = url;
+          s.crossOrigin = "anonymous";
+          s.onload = () => resolve(url);
+          s.onerror = () => reject(new Error("无法加载: " + url));
+          document.head.appendChild(s);
+        });
+      }
+
+      async function loadFirstOk(urls) {
+        let lastErr;
+        for (const url of urls) {
+          try {
+            return await loadScript(url);
+          } catch (err) {
+            lastErr = err;
+            console.warn(err.message);
+          }
+        }
+        throw lastErr || new Error("所有 CDN 均失败");
+      }
+
+      async function run() {
+        try {
+          setLoadStatus("正在加载 Three.js…");
+          await loadFirstOk([
+            "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js",
+            "https://unpkg.com/three@0.160.0/build/three.min.js",
+          ]);
+
+          setLoadStatus("正在加载 MediaPipe Hands…");
+          await loadFirstOk([
+            "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js",
+            "https://unpkg.com/@mediapipe/hands/hands.js",
+          ]);
+
+          setLoadStatus("正在加载应用脚本…");
+          await loadScript("script.js");
+
+          if (window.LiquidHand?.bootstrap) {
+            window.LiquidHand.bootstrap();
+            if (startBtn) {
+              startBtn.disabled = false;
+              startBtn.textContent = "开启摄像头体验";
+            }
+          } else {
+            throw new Error("script.js 未正确初始化");
+          }
+        } catch (err) {
+          showLoadError(
+            err.message +
+              "。若使用 Edge，请在地址栏关闭「跟踪防护」，或换 Chrome 打开。"
+          );
+        }
+      }
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", run);
+      } else {
+        run();
+      }
+    })();
+  </script>
 </body>
 </html>
